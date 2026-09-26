@@ -1,603 +1,47 @@
-name: "🪨 Pebble 0.3.0 — Stoneyard"
+name: "🪨 Pebble 0.5.0 — Slate"
 
 on:
   workflow_dispatch:
   push:
-    branches: ["main"]
+    branches:
+      - main
 
 jobs:
-  stoneyard:
+  slate:
+    name: "🪨 Build Pebble 0.5 — Slate"
     runs-on: ubuntu-latest
 
     steps:
-      - name: 🪨 Checkout
+      - name: "📦 Checkout Pebble"
         uses: actions/checkout@v4
 
-      - name: 🔧 Install tools
+      - name: "🔧 Install build tools"
+        shell: bash
         run: |
+          set -e
+
           sudo apt-get update
+
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
-            qemu-system-arm
+            qemu-system-arm \
+            imagemagick \
+            xxd
 
-      - name: 🧱 Generate Stoneyard
-        run: |
-          mkdir -p src build release
+          echo "🪨 Slate kitchen ready."
 
-          cat > src/boot.S <<'EOF'
-          .section ".text.boot"
-          .global _start
+      # ============================================================
+      # PEBBLE SHORE
+      # ============================================================
 
-          _start:
-              mrs x0, mpidr_el1
-              and x0, x0, #0xff
-              cbnz x0, halt
-
-              ldr x0, =stack_top
-              mov sp, x0
-
-              ldr x0, =__bss_start
-              ldr x1, =__bss_end
-
-          clear_bss:
-              cmp x0, x1
-              b.hs kernel
-              str xzr, [x0], #8
-              b clear_bss
-
-          kernel:
-              bl pebble_main
-
-          halt:
-              wfe
-              b halt
-
-          .section ".bss"
-          .align 12
-          .skip 32768
-          stack_top:
-          EOF
-
-          cat > src/kernel.c <<'EOF'
-          typedef unsigned int u32;
-          typedef unsigned long u64;
-          typedef unsigned long usize;
-
-          #define UART_BASE 0x09000000UL
-          #define UART_DR (*(volatile u32 *)(UART_BASE + 0x00))
-          #define UART_FR (*(volatile u32 *)(UART_BASE + 0x18))
-
-          static void putc(char c)
-          {
-              while (UART_FR & (1u << 5)) {}
-
-              if (c == '\n') {
-                  UART_DR = '\r';
-                  while (UART_FR & (1u << 5)) {}
-              }
-
-              UART_DR = (u32)c;
-          }
-
-          static void print(const char *s)
-          {
-              while (*s) putc(*s++);
-          }
-
-          static int eq(const char *a, const char *b)
-          {
-              while (*a && *b && *a == *b) {
-                  a++;
-                  b++;
-              }
-
-              return *a == *b;
-          }
-
-          static int starts(const char *s, const char *p)
-          {
-              while (*p) {
-                  if (*s++ != *p++)
-                      return 0;
-              }
-
-              return 1;
-          }
-
-          /* =========================================
-             Chalk Guardian
-             ========================================= */
-
-          #define CAP_CONSOLE  (1ULL << 0)
-          #define CAP_FILES    (1ULL << 1)
-          #define CAP_NETWORK  (1ULL << 2)
-          #define CAP_POWER    (1ULL << 3)
-          #define CAP_ADMIN    (1ULL << 4)
-
-          #define DANGER (CAP_POWER | CAP_ADMIN)
-
-          static int chalk_enabled = 1;
-
-          static int chalk_scan(
-              const char *name,
-              u64 caps
-          )
-          {
-              print("\nChalk: scanning ");
-              print(name);
-              print("...\n");
-
-              if (!chalk_enabled) {
-                  print("Chalk: disabled. you're on your own 💀\n");
-                  return 1;
-              }
-
-              if (caps & DANGER) {
-                  print("Chalk: absolutely not.\n");
-
-                  if (caps & CAP_POWER)
-                      print("  [!] system.power\n");
-
-                  if (caps & CAP_ADMIN)
-                      print("  [!] system.admin\n");
-
-                  print("CHALK: BLOCKED\n");
-                  return 0;
-              }
-
-              print("Chalk: looks edible enough.\n");
-              print("CHALK: CLEAR\n");
-
-              return 1;
-          }
-
-          /* =========================================
-             STP — Stone Package format
-             ========================================= */
-
-          struct stp {
-              char magic[4];
-
-              const char *name;
-              const char *version;
-              const char *description;
-
-              u64 capabilities;
-
-              const char *provides;
-          };
-
-          static struct stp repo[] = {
-              {
-                  {'S','T','P','K'},
-                  "chicken",
-                  "1.0",
-                  "An extremely important chicken.",
-                  CAP_CONSOLE,
-                  "chicken.px"
-              },
-
-              {
-                  {'S','T','P','K'},
-                  "chip",
-                  "0.1",
-                  "Pebble emotional support mineral.",
-                  CAP_CONSOLE,
-                  "chip.px"
-              },
-
-              {
-                  {'S','T','P','K'},
-                  "editor",
-                  "0.1",
-                  "Tiny Pebble text editor.",
-                  CAP_CONSOLE | CAP_FILES,
-                  "editor.px"
-              },
-
-              {
-                  {'S','T','P','K'},
-                  "free-nuggets-real",
-                  "6.6.6",
-                  "Definitely trustworthy.",
-                  CAP_CONSOLE | CAP_POWER | CAP_ADMIN,
-                  "totally_safe.px"
-              }
-          };
-
-          #define REPO_COUNT \
-              (sizeof(repo) / sizeof(repo[0]))
-
-          #define MAX_INSTALLED 16
-
-          static struct stp *installed[MAX_INSTALLED];
-          static usize installed_count = 0;
-
-          static struct stp *find_package(
-              const char *name
-          )
-          {
-              usize i;
-
-              for (i = 0; i < REPO_COUNT; i++) {
-                  if (eq(repo[i].name, name))
-                      return &repo[i];
-              }
-
-              return 0;
-          }
-
-          static int already_installed(
-              struct stp *p
-          )
-          {
-              usize i;
-
-              for (i = 0; i < installed_count; i++) {
-                  if (installed[i] == p)
-                      return 1;
-              }
-
-              return 0;
-          }
-
-          static void stpack_install(
-              const char *name
-          )
-          {
-              struct stp *p;
-
-              print("\nstpack: searching Stoneyard...\n");
-
-              p = find_package(name);
-
-              if (!p) {
-                  print("stpack: package not found.\n");
-                  print("Chip: maybe it rolled away?\n");
-                  return;
-              }
-
-              print("stpack: found ");
-              print(p->name);
-              print("-");
-              print(p->version);
-              print(".stp\n");
-
-              if (already_installed(p)) {
-                  print("stpack: already installed 😭\n");
-                  return;
-              }
-
-              if (!chalk_scan(p->name, p->capabilities)) {
-                  print("stpack: installation cancelled.\n");
-                  print("Chip: yeahhhh I wouldn't eat that one.\n");
-                  return;
-              }
-
-              if (installed_count >= MAX_INSTALLED) {
-                  print("stpack: package store full.\n");
-                  return;
-              }
-
-              print("\nstpack: unpacking");
-              print("...............\n");
-
-              installed[installed_count++] = p;
-
-              print("stpack: installed ");
-              print(p->name);
-              print(" successfully.\n");
-
-              if (eq(p->name, "chicken"))
-                  print("stpack: chicken acquired. [nugget pending]\n");
-
-              if (eq(p->name, "chip"))
-                  print("Chip: wait... you installed ME?\n");
-          }
-
-          static void stpack_remove(
-              const char *name
-          )
-          {
-              usize i;
-
-              for (i = 0; i < installed_count; i++) {
-                  if (eq(installed[i]->name, name)) {
-                      usize j;
-
-                      for (j = i; j + 1 < installed_count; j++)
-                          installed[j] = installed[j + 1];
-
-                      installed_count--;
-
-                      print("stpack: removed ");
-                      print(name);
-                      print(".\n");
-
-                      if (eq(name, "chip"))
-                          print("Chip: WAIT COME BACK—\n");
-
-                      return;
-                  }
-              }
-
-              print("stpack: that package isn't installed.\n");
-          }
-
-          static void stpack_list(void)
-          {
-              usize i;
-
-              print("\nInstalled packages:\n");
-
-              if (!installed_count) {
-                  print("  nothing. absolutely barren.\n");
-                  return;
-              }
-
-              for (i = 0; i < installed_count; i++) {
-                  print("  ");
-                  print(installed[i]->name);
-                  print(" ");
-                  print(installed[i]->version);
-                  print("\n");
-              }
-          }
-
-          static void stpack_search(void)
-          {
-              usize i;
-
-              print("\nStoneyard packages:\n");
-
-              for (i = 0; i < REPO_COUNT; i++) {
-                  print("  ");
-                  print(repo[i].name);
-                  print(" ");
-                  print(repo[i].version);
-                  print(" - ");
-                  print(repo[i].description);
-                  print("\n");
-              }
-          }
-
-          static void stpack_info(
-              const char *name
-          )
-          {
-              struct stp *p = find_package(name);
-
-              if (!p) {
-                  print("stpack: package not found.\n");
-                  return;
-              }
-
-              print("\nPackage: ");
-              print(p->name);
-
-              print("\nVersion: ");
-              print(p->version);
-
-              print("\nProvides: ");
-              print(p->provides);
-
-              print("\nAbout: ");
-              print(p->description);
-
-              print("\n");
-          }
-
-          /* =========================================
-             Stone
-             ========================================= */
-
-          static char command[256];
-
-          static char getc(void)
-          {
-              while (UART_FR & (1u << 4)) {}
-              return (char)(UART_DR & 0xff);
-          }
-
-          static void read_command(void)
-          {
-              usize i = 0;
-
-              for (;;) {
-                  char c = getc();
-
-                  if (c == '\n' || c == '\r') {
-                      command[i] = 0;
-                      putc('\n');
-                      return;
-                  }
-
-                  if ((c == 8 || c == 127) && i) {
-                      i--;
-                      print("\b \b");
-                      continue;
-                  }
-
-                  if (c >= 32 && c <= 126 &&
-                      i < sizeof(command) - 1) {
-
-                      command[i++] = c;
-                      putc(c);
-                  }
-              }
-          }
-
-          static void chip(void)
-          {
-              print(
-                  "\n"
-                  "       ___\n"
-                  "     /     \\\n"
-                  "    | o   o |\n"
-                  "    |   v   |\n"
-                  "     \\_____/\n"
-                  "      /   \\\n"
-                  "\n"
-                  "Chip: Stoneyard smells like packages.\n"
-              );
-          }
-
-          static void help(void)
-          {
-              print(
-                  "\nStone 0.3\n"
-                  "---------\n"
-                  "help\n"
-                  "about\n"
-                  "chip\n"
-                  "chalk status\n"
-                  "chalk disable\n"
-                  "chalk enable\n"
-                  "stpack search\n"
-                  "stpack list\n"
-                  "stpack info <package>\n"
-                  "stpack install <package>\n"
-                  "stpack remove <package>\n"
-                  "\n"
-              );
-          }
-
-          static void execute(void)
-          {
-              if (eq(command, "help"))
-                  help();
-
-              else if (eq(command, "about")) {
-                  print(
-                      "Pebble 0.3.0 \"Stoneyard\"\n"
-                      "Stone 0.3\n"
-                      "stpack 0.1\n"
-                      "Chalk Guardian 0.1\n"
-                      "Storage: temporary RAM store\n"
-                  );
-              }
-
-              else if (eq(command, "chip"))
-                  chip();
-
-              else if (eq(command, "chalk status")) {
-                  if (chalk_enabled)
-                      print("Chalk Guardian: ACTIVE\n");
-                  else
-                      print("Chalk Guardian: DISABLED 💀\n");
-              }
-
-              else if (eq(command, "chalk disable")) {
-                  chalk_enabled = 0;
-
-                  print(
-                      "Chalk: protection disabled until reboot.\n"
-                      "Chip: this seems like a questionable decision.\n"
-                  );
-              }
-
-              else if (eq(command, "chalk enable")) {
-                  chalk_enabled = 1;
-                  print("Chalk: Guardian active.\n");
-                  print("Chip: shield acquired. 🛡\n");
-              }
-
-              else if (eq(command, "stpack search"))
-                  stpack_search();
-
-              else if (eq(command, "stpack list"))
-                  stpack_list();
-
-              else if (starts(command, "stpack info "))
-                  stpack_info(command + 12);
-
-              else if (starts(command, "stpack install "))
-                  stpack_install(command + 15);
-
-              else if (starts(command, "stpack remove "))
-                  stpack_remove(command + 14);
-
-              else if (eq(command, "chicken nugget"))
-                  print("Chip: finally, some good fucking food.\n");
-
-              else if (eq(command, "linux"))
-                  print("Stone: still don't know her.\n");
-
-              else {
-                  print("Stone: what the hell is '");
-                  print(command);
-                  print("' 😭\n");
-              }
-          }
-
-          void pebble_main(void)
-          {
-              print(
-                  "\n"
-                  "====================================\n"
-                  "              PEBBLE\n"
-                  "====================================\n"
-                  "\n"
-                  "Pebble 0.3.0 \"Stoneyard\"\n"
-                  "\n"
-                  "[ OK ] Pebble Kernel\n"
-                  "[ OK ] Stone 0.3\n"
-                  "[ OK ] stpack\n"
-                  "[ OK ] STP package format\n"
-                  "[ OK ] Chalk Guardian\n"
-                  "[ OK ] Chip is emotionally available\n"
-                  "\n"
-                  "Pebble: welcome to the package yard.\n"
-              );
-
-              for (;;) {
-                  print("\nstone ::> ");
-                  read_command();
-                  execute();
-              }
-          }
-          EOF
-
-          cat > src/linker.ld <<'EOF'
-          ENTRY(_start)
-
-          SECTIONS
-          {
-              . = 0x40080000;
-
-              .text : ALIGN(4096)
-              {
-                  KEEP(*(.text.boot))
-                  *(.text*)
-              }
-
-              .rodata : ALIGN(4096)
-              {
-                  *(.rodata*)
-              }
-
-              .data : ALIGN(4096)
-              {
-                  *(.data*)
-              }
-
-              .bss : ALIGN(4096)
-              {
-                  __bss_start = .;
-                  *(.bss*)
-                  *(COMMON)
-                  __bss_end = .;
-              }
-          }
-          EOF
-          
-      - name: 🏝️ Cook Pebble Shore
+      - name: "🏝️ Cook Pebble Shore"
         shell: bash
         run: |
           set -e
 
           mkdir -p build/wallpaper
+
           WALLPAPER="assets/IMG_1526.gif"
 
           echo "========================================"
@@ -610,178 +54,260 @@ jobs:
             exit 1
           fi
 
-          echo "🏝️ Found IMG_1526.gif"
+          echo "🏝️ Found $WALLPAPER"
 
-          FRAMES=$(identify "$WALLPAPER" | wc -l)
+          identify "$WALLPAPER" | head -n 5 || true
 
-          echo "🎞️ GIF frames: $FRAMES"
-          echo "🪨 Converting beach into rocks..."
+          echo "🪨 Extracting first Slate frame..."
 
-          magick "$WALLPAPER" \
-            -coalesce \
+          magick "$WALLPAPER[0]" \
             -resize '640x480!' \
-            -colors 256 \
-            'build/wallpaper/frame-%03d.png'
+            -alpha off \
+            build/wallpaper/boot.png
 
-          FRAME_COUNT=$(find build/wallpaper -name 'frame-*.png' | wc -l)
+          echo "🎨 Converting wallpaper to RGB..."
 
-          echo "✓ Produced $FRAME_COUNT Slate frames"
-
-          magick build/wallpaper/frame-000.png \
+          magick build/wallpaper/boot.png \
             -depth 8 \
             RGB:build/wallpaper/boot.rgb
 
-          printf '%s\n' \
-            'PWAL' \
-            'name=Pebble Shore' \
-            'source=IMG_1526.gif' \
-            'width=640' \
-            'height=480' \
-            "frames=$FRAME_COUNT" \
-            'animated=true' \
-            > build/wallpaper/wallpaper.meta
+          echo "✓ Pebble Shore prepared."
 
-          echo ""
-          echo "🏝️ Pebble Shore cooked."
-          echo "Chip: BEACH EPISODE 🔥"
+      # ============================================================
+      # EMBED WALLPAPER
+      # ============================================================
 
-      - name: 🪨 Embed Slate assets
+      - name: "🪨 Embed Slate assets"
         shell: bash
         run: |
           set -e
 
-          echo "🪨 Embedding Pebble Shore..."
+          mkdir -p build/generated
 
-          xxd -i build/wallpaper/boot.rgb \
-            > build/wallpaper/boot_wallpaper.h
+          echo "🪨 Converting Pebble Shore into C..."
 
-          echo "✓ Generated boot_wallpaper.h"
-          echo "🏝️ Beach successfully converted into C nonsense."
-          
-      - name: 🔥 Compile Stoneyard
+          xxd -i \
+            build/wallpaper/boot.rgb \
+            > build/generated/boot_wallpaper.h
+
+          echo "✓ Wallpaper header generated."
+
+          wc -c build/wallpaper/boot.rgb
+          wc -c build/generated/boot_wallpaper.h
+
+          echo "Chip: beach acquired 😎"
+
+      # ============================================================
+      # GENERATE SLATE BOOT UI
+      # ============================================================
+
+      - name: "✨ Generate Slate loader"
+        shell: bash
         run: |
-       COMMON="-ffreestanding -fno-stack-protector -fno-pie -nostdlib"
+          set -e
 
-          aarch64-linux-gnu-gcc $COMMON \
-            -c src/boot.S \
-            -o build/boot.o
+          mkdir -p build/generated
 
-          aarch64-linux-gnu-gcc $COMMON \
-            -O2 -Wall -Wextra \
-            -c src/kernel.c \
-            -o build/kernel.o
+          cat > build/generated/slate_boot.h <<'SLATEEOF'
+          #ifndef PEBBLE_SLATE_BOOT_H
+          #define PEBBLE_SLATE_BOOT_H
+
+          typedef struct {
+              unsigned int progress;
+              const char *message;
+              const char *chip;
+          } slate_boot_stage_t;
+
+          static const slate_boot_stage_t slate_boot_stages[] = {
+              {  5, "Starting Pebble",       "Chip: ...zzz" },
+              { 15, "Starting kernel",       "Chip: huh?" },
+              { 28, "Starting display",      "Chip: OOO COLORS" },
+              { 42, "Loading Chalk",         "Chip: security rock deployed." },
+              { 57, "Mounting Amethyst",     "Chip: shiny filesystem time." },
+              { 70, "Starting Stoneyard",    "Chip: packages acquired." },
+              { 84, "Loading Pebble Shore",  "Chip: BEACH EPISODE!" },
+              { 94, "Waking Chip",           "Chip: five more minutes..." },
+              {100, "Ready",                 "Chip: LET'S ROCK." }
+          };
+
+          #define SLATE_BOOT_STAGE_COUNT \
+              (sizeof(slate_boot_stages) / sizeof(slate_boot_stages[0]))
+
+          #endif
+          SLATEEOF
+
+          echo "✓ Dynamic Slate boot stages generated."
+
+      # ============================================================
+      # BUILD
+      # ============================================================
+
+      - name: "🔥 Build Pebble"
+        shell: bash
+        run: |
+          set -e
+
+          mkdir -p build
+
+          echo "========================================"
+          echo "          PEBBLE 0.5 — SLATE"
+          echo "========================================"
+
+          if [ ! -f linker.ld ]; then
+            echo "💀 linker.ld is missing"
+            exit 1
+          fi
+
+          if [ ! -f src/kernel.c ]; then
+            echo "💀 src/kernel.c is missing"
+            exit 1
+          fi
+
+          CFLAGS="-ffreestanding -nostdlib -nostartfiles -O2 -Wall -Wextra"
+
+          SOURCES=""
+
+          for file in src/*.c; do
+            [ -e "$file" ] || continue
+
+            obj="build/$(basename "${file%.c}").o"
+
+            echo "🔨 $file"
+
+            aarch64-linux-gnu-gcc \
+              $CFLAGS \
+              -Ibuild/generated \
+              -Isrc \
+              -c "$file" \
+              -o "$obj"
+
+            SOURCES="$SOURCES $obj"
+          done
+
+          if [ -f src/boot.S ]; then
+            echo "🔨 src/boot.S"
+
+            aarch64-linux-gnu-gcc \
+              -ffreestanding \
+              -c src/boot.S \
+              -o build/boot.o
+
+            SOURCES="$SOURCES build/boot.o"
+          fi
+
+          echo "🔗 Linking Slate..."
 
           aarch64-linux-gnu-ld \
-            -T src/linker.ld \
-            build/boot.o \
-            build/kernel.o \
+            -T linker.ld \
+            $SOURCES \
             -o build/pebble.elf
 
-          echo "🪨 Stoneyard compiled."
-          file build/pebble.elf
+          echo ""
+          echo "🪨 Pebble ELF:"
+          ls -lh build/pebble.elf
 
-      - name: 🐔 Abuse the package manager
+      # ============================================================
+      # VERIFY
+      # ============================================================
+
+      - name: "🔎 Inspect Pebble"
+        shell: bash
         run: |
-          set +e
+          set -e
 
-          {
-            sleep 1
+          echo "Architecture:"
+          aarch64-linux-gnu-readelf -h build/pebble.elf
 
-            echo "about"
-            echo "stpack search"
+          echo ""
+          echo "Sections:"
+          aarch64-linux-gnu-readelf -S build/pebble.elf
 
-            echo "stpack install chicken"
-            echo "stpack install chip"
-            echo "stpack install editor"
+          echo ""
+          echo "🪨 ELF survived inspection."
 
-            echo "stpack list"
+      # ============================================================
+      # BOOT TEST
+      # ============================================================
 
-            echo "stpack install free-nuggets-real"
+      - name: "🚀 Boot Slate"
+        shell: bash
+        run: |
+          set -e
 
-            echo "chalk status"
-            echo "chalk disable"
+          echo "========================================"
+          echo "          BOOTING THE ROCK"
+          echo "========================================"
 
-            echo "stpack install free-nuggets-real"
-
-            echo "stpack list"
-
-            echo "chalk enable"
-
-            echo "stpack remove chip"
-
-            echo "chicken nugget"
-            echo "linux"
-
-            sleep 1
-          } | timeout 7s qemu-system-aarch64 \
+          timeout 10s \
+            qemu-system-aarch64 \
               -M virt \
               -cpu cortex-a53 \
               -m 128M \
               -nographic \
               -kernel build/pebble.elf \
-              > build/boot.log 2>&1
+              > build/boot.log 2>&1 || true
 
+          echo ""
+          echo "========== PEBBLE SERIAL =========="
+          cat build/boot.log
+          echo "==================================="
+
+          if grep -q "Pebble" build/boot.log; then
+            echo "✓ Pebble spoke."
+          else
+            echo "⚠️ Pebble produced no recognizable boot message."
+          fi
+
+      # ============================================================
+      # RELEASE PACKAGE
+      # ============================================================
+
+      - name: "📦 Package Slate"
+        shell: bash
+        run: |
           set -e
 
-          cat build/boot.log
+          mkdir -p build/release
 
-          echo ""
-          echo "========= STONEYARD TESTS ========="
+          cp build/pebble.elf \
+            build/release/pebble-0.5.0-slate.elf
 
-          grep -q 'Pebble 0.3.0 "Stoneyard"' build/boot.log
-          echo "✓ Pebble booted"
+          cp build/boot.log \
+            build/release/boot.log
 
-          grep -q "installed chicken successfully" build/boot.log
-          echo "✓ chicken acquired"
+          cp build/wallpaper/boot.png \
+            build/release/pebble-shore-preview.png
 
-          grep -q "installed chip successfully" build/boot.log
-          echo "✓ emotional support installed"
+          cat > build/release/README.txt <<'EOF'
+          Pebble OS 0.5.0 — Slate
+          =======================
 
-          grep -q "CHALK: BLOCKED" build/boot.log
-          echo "✓ Chalk told malware to piss off"
+          Architecture: AArch64
+          Kernel: Pebble
+          Shell: Stone
+          Package Manager: stpack
+          Package Repository: Stoneyard
+          Security: Chalk Guardian
+          Filesystem: Amethyst
+          Desktop: Slate
 
-          grep -q "protection disabled until reboot" build/boot.log
-          echo "✓ Chalk toggle works"
+          Wallpaper:
+          Pebble Shore
 
-          grep -q "installed free-nuggets-real successfully" build/boot.log
-          echo "✓ terrible decisions are technically possible"
+          Emotional Support Mineral:
+          Chip
 
-          grep -q "Chip: WAIT COME BACK" build/boot.log
-          echo "✓ Chip experienced abandonment"
+          No Linux.
+          No distro underneath.
+          Just Pebble.
 
-          grep -q "finally, some good" build/boot.log
-          echo "✓ chicken nugget subsystem operational"
-
-          echo ""
-          echo "🪨📦🔥 STONEYARD LIVES"
-
-      - name: 📦 Package Pebble
-        run: |
-          cp build/pebble.elf release/pebble-aarch64.elf
-          cp build/boot.log release/boot.log
-
-          cat > release/README.txt <<'EOF'
-          Pebble 0.3.0 "Stoneyard"
-
-          Includes:
-          - Stone 0.3
-          - stpack package manager
-          - STP package metadata
-          - package installation/removal
-          - Chalk package scanning
-          - temporary Chalk disable toggle
-          - embedded Stoneyard repository
-          - Chip
-          - chicken
-
-          Package storage is currently volatile.
-          Pebble 0.4 will introduce persistent Amethyst storage.
-
-          The rock has packages now.
+          The rock lives.
           EOF
 
-      - name: ⬆️ Upload Stoneyard
+          echo "🪨 Slate packaged."
+
+      - name: "⬆️ Upload Pebble 0.5"
         uses: actions/upload-artifact@v4
         with:
-          name: pebble-0.3.0-stoneyard
-          path: release/
+          name: pebble-0.5.0-slate
+          path: build/release/
