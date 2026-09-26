@@ -60,14 +60,14 @@ jobs:
 
           echo "🪨 Extracting first Slate frame..."
 
-          magick "$WALLPAPER[0]" \
+          convert "$WALLPAPER[0]" \
             -resize '640x480!' \
             -alpha off \
             build/wallpaper/boot.png
 
           echo "🎨 Converting wallpaper to RGB..."
 
-          magick build/wallpaper/boot.png \
+          convert build/wallpaper/boot.png \
             -depth 8 \
             RGB:build/wallpaper/boot.rgb
 
