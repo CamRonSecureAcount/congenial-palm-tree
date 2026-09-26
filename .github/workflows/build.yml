@@ -1,4 +1,4 @@
-name: "🪨 Pebble 0.1.0 — Boulder"
+name: "🪨 Pebble 0.2.0 — Quarry"
 
 on:
   workflow_dispatch:
@@ -6,14 +6,14 @@ on:
     branches: ["main"]
 
 jobs:
-  build-pebble:
+  quarry:
     runs-on: ubuntu-latest
 
     steps:
-      - name: 🪨 Checkout
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: 🔧 Install tools
+      - name: Install tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -21,9 +21,13 @@ jobs:
             binutils-aarch64-linux-gnu \
             qemu-system-arm
 
-      - name: 🧱 Generate Pebble
+      - name: Generate Quarry source
         run: |
           mkdir -p src build release
+
+          # ============================================
+          # BOOT
+          # ============================================
 
           cat > src/boot.S <<'EOF'
           .section ".text.boot"
@@ -32,48 +36,276 @@ jobs:
           _start:
               mrs x0, mpidr_el1
               and x0, x0, #0xff
-              cbnz x0, halt
+              cbnz x0, 9f
 
-              ldr x0, =stack_top
+              ldr x0, =kernel_stack_top
               mov sp, x0
 
               ldr x0, =__bss_start
               ldr x1, =__bss_end
 
-          clear_bss:
+          1:
               cmp x0, x1
-              b.hs start_kernel
+              b.hs 2f
               str xzr, [x0], #8
-              b clear_bss
+              b 1b
 
-          start_kernel:
+          2:
               bl pebble_main
 
-          halt:
+          9:
               wfe
-              b halt
+              b 9b
 
           .section ".bss"
           .align 12
-          stack_bottom:
+          kernel_stack_bottom:
               .skip 32768
-          stack_top:
+          kernel_stack_top:
           EOF
+
+          # ============================================
+          # EXCEPTION VECTOR + SVC HANDLER
+          # ============================================
+
+          cat > src/vectors.S <<'EOF'
+          .section ".text"
+          .align 11
+          .global exception_vectors
+          .global enter_el0
+
+          exception_vectors:
+
+          // Current EL with SP0
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+
+          // Current EL with SPx
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+
+          // Lower EL using AArch64
+          .balign 128
+          b lower_sync
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+
+          // Lower EL using AArch32
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+          .balign 128
+          b exception_panic
+
+          lower_sync:
+              sub sp, sp, #(18 * 8)
+
+              stp x0,  x1,  [sp, #(0 * 8)]
+              stp x2,  x3,  [sp, #(2 * 8)]
+              stp x4,  x5,  [sp, #(4 * 8)]
+              stp x6,  x7,  [sp, #(6 * 8)]
+              stp x8,  x9,  [sp, #(8 * 8)]
+              stp x10, x11, [sp, #(10 * 8)]
+              stp x12, x13, [sp, #(12 * 8)]
+              stp x14, x15, [sp, #(14 * 8)]
+              stp x16, x17, [sp, #(16 * 8)]
+
+              mrs x1, esr_el1
+              lsr x1, x1, #26
+
+              // EC 0x15 = SVC from AArch64.
+              cmp x1, #0x15
+              b.ne exception_panic_saved
+
+              // x8 = syscall number.
+              mov x0, sp
+              bl syscall_dispatch
+
+              // Return value -> saved x0.
+              str x0, [sp]
+
+              ldp x0,  x1,  [sp, #(0 * 8)]
+              ldp x2,  x3,  [sp, #(2 * 8)]
+              ldp x4,  x5,  [sp, #(4 * 8)]
+              ldp x6,  x7,  [sp, #(6 * 8)]
+              ldp x8,  x9,  [sp, #(8 * 8)]
+              ldp x10, x11, [sp, #(10 * 8)]
+              ldp x12, x13, [sp, #(12 * 8)]
+              ldp x14, x15, [sp, #(14 * 8)]
+              ldp x16, x17, [sp, #(16 * 8)]
+
+              add sp, sp, #(18 * 8)
+              eret
+
+          exception_panic_saved:
+              add sp, sp, #(18 * 8)
+
+          exception_panic:
+              bl pebble_exception_panic
+
+          1:
+              wfe
+              b 1b
+
+          // x0 = userspace entry
+          // x1 = userspace stack
+          enter_el0:
+              msr sp_el0, x1
+              msr elr_el1, x0
+
+              // EL0t, interrupts masked during this early implementation.
+              mov x2, #0x3c0
+              msr spsr_el1, x2
+
+              isb
+              eret
+          EOF
+
+          # ============================================
+          # USERSPACE PROGRAMS
+          # ============================================
+
+          cat > src/users.S <<'EOF'
+          .section ".rodata"
+
+          .global hello_start
+          .global hello_end
+          .global chip_start
+          .global chip_end
+
+          // --------------------------------------------
+          // hello.px payload
+          // --------------------------------------------
+
+          .align 4
+          hello_start:
+
+              adr x0, hello_text
+              mov x8, #1
+              svc #0
+
+              // Ask kernel which EL the caller is from.
+              mov x8, #2
+              svc #0
+
+              cmp x0, #0
+              b.ne hello_bad
+
+              adr x0, el0_text
+              mov x8, #1
+              svc #0
+
+              mov x0, #0
+              mov x8, #3
+              svc #0
+
+          hello_loop:
+              b hello_loop
+
+          hello_bad:
+              adr x0, bad_text
+              mov x8, #1
+              svc #0
+
+              mov x0, #1
+              mov x8, #3
+              svc #0
+
+              b hello_loop
+
+          hello_text:
+              .asciz "hello.px: Hello from Pebble userspace!\nhello.px: write syscall = OK\n"
+
+          el0_text:
+              .asciz "hello.px: CurrentEL = EL0\n"
+
+          bad_text:
+              .asciz "hello.px: ERROR - not EL0\n"
+
+          hello_end:
+
+          // --------------------------------------------
+          // chip.px payload
+          // --------------------------------------------
+
+          .align 4
+          chip_start:
+
+              adr x0, chip_text
+              mov x8, #1
+              svc #0
+
+              mov x0, #0
+              mov x8, #3
+              svc #0
+
+          chip_loop:
+              b chip_loop
+
+          chip_text:
+              .asciz "\n       ___\n     /     \\\n    | o   o |\n    |   v   |\n     \\_____/\n      /   \\\n\nChip: holy rock, I'm in userspace.\n"
+
+          chip_end:
+          EOF
+
+          # ============================================
+          # KERNEL
+          # ============================================
 
           cat > src/kernel.c <<'EOF'
           typedef unsigned long u64;
           typedef unsigned int  u32;
-          typedef unsigned long usize;
-
-          /* =========================================
-             UART — QEMU PL011
-             ========================================= */
+          typedef unsigned short u16;
 
           #define UART_BASE 0x09000000UL
           #define UART_DR (*(volatile u32 *)(UART_BASE + 0x00))
           #define UART_FR (*(volatile u32 *)(UART_BASE + 0x18))
 
-          static void putc(char c)
+          #define CAP_CONSOLE       (1ULL << 0)
+          #define CAP_FILE_READ     (1ULL << 1)
+          #define CAP_FILE_WRITE    (1ULL << 2)
+          #define CAP_PROCESS       (1ULL << 3)
+          #define CAP_NETWORK       (1ULL << 4)
+          #define CAP_POWER         (1ULL << 5)
+          #define CAP_ADMIN         (1ULL << 6)
+
+          #define DANGEROUS_CAPS \
+              (CAP_FILE_WRITE | CAP_NETWORK | CAP_POWER | CAP_ADMIN)
+
+          #define SYS_WRITE       1
+          #define SYS_CURRENT_EL  2
+          #define SYS_EXIT        3
+
+          extern unsigned char exception_vectors[];
+
+          extern unsigned char hello_start[];
+          extern unsigned char hello_end[];
+
+          extern unsigned char chip_start[];
+          extern unsigned char chip_end[];
+
+          extern void enter_el0(void *entry, void *stack);
+
+          static void uart_putc(char c)
           {
               while (UART_FR & (1u << 5)) {}
 
@@ -85,441 +317,315 @@ jobs:
               UART_DR = (u32)c;
           }
 
-          static char getc(void)
-          {
-              while (UART_FR & (1u << 4)) {}
-              return (char)(UART_DR & 0xff);
-          }
-
           static void print(const char *s)
           {
               while (*s)
-                  putc(*s++);
+                  uart_putc(*s++);
           }
 
-          /* =========================================
-             Tiny string library
-             ========================================= */
-
-          static int strcmp(const char *a, const char *b)
+          static int streq(const char *a, const char *b)
           {
-              while (*a && (*a == *b)) {
+              while (*a && *b) {
+                  if (*a != *b)
+                      return 0;
+
                   a++;
                   b++;
               }
 
-              return *(const unsigned char *)a -
-                     *(const unsigned char *)b;
+              return *a == *b;
           }
 
-          static int starts(const char *s, const char *prefix)
+          struct pex {
+              char magic[4];
+              u16 version;
+              u16 arch;
+              u32 flags;
+
+              u64 capabilities;
+
+              const unsigned char *code;
+              u64 code_size;
+
+              const char *name;
+          };
+
+          static struct pex hello_pex = {
+              {'P','E','X','E'},
+              1,
+              1,
+              0,
+              CAP_CONSOLE,
+              hello_start,
+              0,
+              "hello.px"
+          };
+
+          static struct pex chip_pex = {
+              {'P','E','X','E'},
+              1,
+              1,
+              0,
+              CAP_CONSOLE,
+              chip_start,
+              0,
+              "chip.px"
+          };
+
+          static struct pex sus_pex = {
+              {'P','E','X','E'},
+              1,
+              1,
+              0,
+              CAP_CONSOLE | CAP_POWER | CAP_ADMIN,
+              hello_start,
+              0,
+              "free_nuggets_REAL.px"
+          };
+
+          static unsigned char user_area[16384]
+              __attribute__((aligned(4096)));
+
+          static unsigned char user_stack[16384]
+              __attribute__((aligned(4096)));
+
+          static volatile int process_exited = 0;
+          static volatile u64 process_exit_code = 0;
+          static u64 current_caps = 0;
+
+          static void copy_bytes(
+              unsigned char *dst,
+              const unsigned char *src,
+              u64 count
+          )
           {
-              while (*prefix) {
-                  if (*s++ != *prefix++)
-                      return 0;
+              u64 i;
+
+              for (i = 0; i < count; i++)
+                  dst[i] = src[i];
+          }
+
+          static int chalk_scan(struct pex *p)
+          {
+              print("\nCHALK GUARDIAN\n");
+              print("Scanning ");
+              print(p->name);
+              print("...\n");
+
+              if (p->magic[0] != 'P' ||
+                  p->magic[1] != 'E' ||
+                  p->magic[2] != 'X' ||
+                  p->magic[3] != 'E') {
+
+                  print("[!] Invalid PEX structure\n");
+                  print("CHALK: BLOCKED\n");
+                  return 0;
               }
+
+              print("[OK] PEX structure\n");
+
+              if (p->version != 1 || p->arch != 1) {
+                  print("[!] Unsupported PEX target\n");
+                  print("CHALK: BLOCKED\n");
+                  return 0;
+              }
+
+              print("[OK] AArch64 target\n");
+
+              if (p->capabilities & DANGEROUS_CAPS) {
+                  print("[!] Dangerous capabilities detected\n");
+
+                  if (p->capabilities & CAP_FILE_WRITE)
+                      print("    filesystem.write\n");
+
+                  if (p->capabilities & CAP_NETWORK)
+                      print("    network.connect\n");
+
+                  if (p->capabilities & CAP_POWER)
+                      print("    system.power\n");
+
+                  if (p->capabilities & CAP_ADMIN)
+                      print("    system.admin\n");
+
+                  print("CHALK: BLOCKED\n");
+                  return 0;
+              }
+
+              print("[OK] Capabilities acceptable\n");
+              print("CHALK: CLEAR\n");
 
               return 1;
           }
 
-          static void strcpy(char *dst, const char *src)
+          /*
+           * Register frame from vectors.S:
+           *
+           * frame[0]  = x0
+           * frame[1]  = x1
+           * ...
+           * frame[8]  = x8
+           */
+          u64 syscall_dispatch(u64 *frame)
           {
-              while ((*dst++ = *src++)) {}
-          }
+              u64 number = frame[8];
 
-          static usize strlen(const char *s)
-          {
-              usize n = 0;
+              if (number == SYS_WRITE) {
+                  if (!(current_caps & CAP_CONSOLE))
+                      return (u64)-1;
 
-              while (*s++)
-                  n++;
-
-              return n;
-          }
-
-          static void print_number(u64 n)
-          {
-              char buf[32];
-              int i = 0;
-
-              if (n == 0) {
-                  putc('0');
-                  return;
-              }
-
-              while (n) {
-                  buf[i++] = '0' + (n % 10);
-                  n /= 10;
-              }
-
-              while (i)
-                  putc(buf[--i]);
-          }
-
-          /* =========================================
-             Boulder memory allocator
-             ========================================= */
-
-          #define HEAP_SIZE (256 * 1024)
-
-          static unsigned char heap[HEAP_SIZE];
-          static usize heap_used = 0;
-
-          static void *pebble_alloc(usize bytes)
-          {
-              bytes = (bytes + 15) & ~15UL;
-
-              if (heap_used + bytes > HEAP_SIZE)
+                  print((const char *)frame[0]);
                   return 0;
-
-              void *result = &heap[heap_used];
-              heap_used += bytes;
-
-              return result;
-          }
-
-          /* =========================================
-             Pebble RAM filesystem
-             ========================================= */
-
-          #define MAX_FILES 32
-          #define NAME_SIZE 32
-          #define DATA_SIZE 256
-
-          struct file {
-              int used;
-              int directory;
-
-              char name[NAME_SIZE];
-              char data[DATA_SIZE];
-          };
-
-          static struct file files[MAX_FILES];
-
-          static struct file *find_file(const char *name)
-          {
-              int i;
-
-              for (i = 0; i < MAX_FILES; i++) {
-                  if (files[i].used &&
-                      strcmp(files[i].name, name) == 0)
-                      return &files[i];
               }
 
-              return 0;
-          }
-
-          static struct file *create_file(
-              const char *name,
-              int directory
-          )
-          {
-              int i;
-
-              if (find_file(name))
+              if (number == SYS_CURRENT_EL) {
+                  /*
+                   * The synchronous exception came from the
+                   * lower-EL AArch64 vector slot, therefore
+                   * the caller was EL0.
+                   */
                   return 0;
-
-              for (i = 0; i < MAX_FILES; i++) {
-                  if (!files[i].used) {
-                      files[i].used = 1;
-                      files[i].directory = directory;
-
-                      strcpy(files[i].name, name);
-                      files[i].data[0] = 0;
-
-                      return &files[i];
-                  }
               }
 
-              return 0;
-          }
-
-          static void fs_init(void)
-          {
-              struct file *f;
-
-              create_file("system", 1);
-              create_file("home", 1);
-
-              f = create_file("welcome.txt", 0);
-
-              if (f)
-                  strcpy(
-                      f->data,
-                      "Welcome to Pebble. The rock lives."
-                  );
-          }
-
-          static void list_files(void)
-          {
-              int i;
-
-              for (i = 0; i < MAX_FILES; i++) {
-                  if (!files[i].used)
-                      continue;
-
-                  if (files[i].directory)
-                      print("[dir]  ");
-                  else
-                      print("[file] ");
-
-                  print(files[i].name);
-                  print("\n");
-              }
-          }
-
-          /* =========================================
-             Stone
-             ========================================= */
-
-          #define COMMAND_SIZE 256
-
-          static char command[COMMAND_SIZE];
-
-          static void stone_prompt(void)
-          {
-              print("\nstone ::> ");
-          }
-
-          static void read_command(void)
-          {
-              int i = 0;
-
-              for (;;) {
-                  char c = getc();
-
-                  if (c == '\r' || c == '\n') {
-                      putc('\n');
-                      command[i] = 0;
-                      return;
-                  }
-
-                  if ((c == 8 || c == 127) && i > 0) {
-                      i--;
-                      print("\b \b");
-                      continue;
-                  }
-
-                  if (c >= 32 && c <= 126 &&
-                      i < COMMAND_SIZE - 1) {
-
-                      command[i++] = c;
-                      putc(c);
-                  }
-              }
-          }
-
-          static void stone_help(void)
-          {
-              print(
-                  "\n"
-                  "Stone commands\n"
-                  "--------------\n"
-                  "help               show commands\n"
-                  "about              about Pebble\n"
-                  "clear              clear screen\n"
-                  "echo <text>         print text\n"
-                  "memory              heap information\n"
-                  "ls                  list RAM objects\n"
-                  "touch <name>        create file\n"
-                  "mkdir <name>        create directory\n"
-                  "write <file> <txt>  write file\n"
-                  "read <file>         read file\n"
-                  "reboot              reboot Pebble\n"
-              );
-          }
-
-          static void stone_execute(void)
-          {
-              if (!command[0])
-                  return;
-
-              if (strcmp(command, "help") == 0) {
-                  stone_help();
-              }
-
-              else if (strcmp(command, "about") == 0) {
-                  print(
-                      "Pebble 0.1.0 \"Boulder\"\n"
-                      "Architecture: AArch64\n"
-                      "Kernel: Pebble\n"
-                      "Shell: Stone 0.1\n"
-                      "No Linux underneath.\n"
-                  );
-              }
-
-              else if (strcmp(command, "ls") == 0) {
-                  list_files();
-              }
-
-              else if (strcmp(command, "memory") == 0) {
-                  print("Heap used: ");
-                  print_number(heap_used);
-
-                  print(" / ");
-                  print_number(HEAP_SIZE);
-
-                  print(" bytes\n");
-              }
-
-              else if (strcmp(command, "clear") == 0) {
-                  print("\033[2J\033[H");
-              }
-
-              else if (starts(command, "echo ")) {
-                  print(command + 5);
-                  print("\n");
-              }
-
-              else if (starts(command, "touch ")) {
-                  const char *name = command + 6;
-
-                  if (!*name) {
-                      print("stone: missing filename\n");
-                  }
-                  else if (create_file(name, 0)) {
-                      print("created ");
-                      print(name);
-                      print("\n");
-                  }
-                  else {
-                      print("stone: could not create file\n");
-                  }
-              }
-
-              else if (starts(command, "mkdir ")) {
-                  const char *name = command + 6;
-
-                  if (!*name) {
-                      print("stone: missing directory name\n");
-                  }
-                  else if (create_file(name, 1)) {
-                      print("created directory ");
-                      print(name);
-                      print("\n");
-                  }
-                  else {
-                      print("stone: could not create directory\n");
-                  }
-              }
-
-              else if (starts(command, "read ")) {
-                  const char *name = command + 5;
-                  struct file *f = find_file(name);
-
-                  if (!f) {
-                      print("stone: file not found\n");
-                  }
-                  else if (f->directory) {
-                      print("stone: that's a directory\n");
-                  }
-                  else {
-                      print(f->data);
-                      print("\n");
-                  }
-              }
-
-              else if (starts(command, "write ")) {
-                  char *p = command + 6;
-                  char *name = p;
-
-                  while (*p && *p != ' ')
-                      p++;
-
-                  if (!*p) {
-                      print("usage: write <file> <text>\n");
-                  }
-                  else {
-                      *p++ = 0;
-
-                      struct file *f = find_file(name);
-
-                      if (!f) {
-                          print("stone: file not found\n");
-                      }
-                      else if (f->directory) {
-                          print("stone: cannot write directory\n");
-                      }
-                      else if (strlen(p) >= DATA_SIZE) {
-                          print("stone: text too large\n");
-                      }
-                      else {
-                          strcpy(f->data, p);
-
-                          print("written ");
-                          print_number(strlen(p));
-                          print(" bytes\n");
-                      }
-                  }
-              }
-
-              else if (strcmp(command, "linux") == 0) {
-                  print("stone: what is a linux\n");
-              }
-
-              else if (strcmp(command, "chicken nugget") == 0) {
-                  print("stone: delicious.\n");
-              }
-
-              else if (strcmp(command, "reboot") == 0) {
-                  print("stone: reboot requested\n");
+              if (number == SYS_EXIT) {
+                  process_exit_code = frame[0];
+                  process_exited = 1;
 
                   /*
-                   * QEMU virt power controller.
+                   * Quarry's first process model does not yet
+                   * context-switch back from EL0. Emit the
+                   * result and stop this virtual CPU.
                    */
-                  *(volatile u32 *)0x09020000 = 0x7777;
-              }
+                  print("\nKernel: userspace requested exit\n");
 
-              else {
-                  print("stone: unknown command: ");
-                  print(command);
-                  print("\n");
-              }
-          }
+                  if (process_exit_code == 0)
+                      print("Kernel: exit code 0\n");
+                  else
+                      print("Kernel: non-zero exit\n");
 
-          /* =========================================
-             Pebble kernel
-             ========================================= */
-
-          void pebble_main(void)
-          {
-              /*
-               * Prove our allocator actually works.
-               */
-              void *test = pebble_alloc(64);
-
-              if (!test) {
-                  print("PANIC: allocator failed\n");
+                  print("Kernel: Quarry userspace test complete\n");
 
                   for (;;)
                       __asm__ volatile("wfe");
               }
 
-              fs_init();
+              return (u64)-1;
+          }
+
+          void pebble_exception_panic(void)
+          {
+              print("\nPEBBLE PANIC\n");
+              print("Unhandled exception.\n");
+
+              for (;;)
+                  __asm__ volatile("wfe");
+          }
+
+          static void install_vectors(void)
+          {
+              __asm__ volatile(
+                  "msr vbar_el1, %0\n"
+                  "isb\n"
+                  :
+                  : "r"(exception_vectors)
+                  : "memory"
+              );
+          }
+
+          static void launch_pex(struct pex *p)
+          {
+              u64 size;
+
+              if (!chalk_scan(p))
+                  return;
+
+              size = p->code_size;
+
+              if (size > sizeof(user_area)) {
+                  print("PEX: image too large\n");
+                  return;
+              }
+
+              copy_bytes(user_area, p->code, size);
+
+              /*
+               * We don't have an MMU yet, so EL0 and EL1
+               * currently share the same physical address
+               * space. Privilege separation is real, memory
+               * isolation comes in the next memory milestone.
+               */
+              current_caps = p->capabilities;
+              process_exited = 0;
+
+              print("PEX: entering EL0...\n");
+
+              __asm__ volatile(
+                  "dsb ish\n"
+                  "ic iallu\n"
+                  "dsb ish\n"
+                  "isb\n"
+                  ::: "memory"
+              );
+
+              enter_el0(
+                  user_area,
+                  user_stack + sizeof(user_stack)
+              );
+
+              /*
+               * ERET does not normally return here.
+               */
+              for (;;)
+                  __asm__ volatile("wfe");
+          }
+
+          void pebble_main(void)
+          {
+              hello_pex.code_size =
+                  (u64)(hello_end - hello_start);
+
+              chip_pex.code_size =
+                  (u64)(chip_end - chip_start);
+
+              sus_pex.code_size =
+                  hello_pex.code_size;
+
+              install_vectors();
 
               print("\n");
               print("====================================\n");
               print("              PEBBLE\n");
               print("====================================\n\n");
 
-              print("Pebble 0.1.0 \"Boulder\"\n");
+              print("Pebble 0.2.0 \"Quarry\"\n");
               print("Architecture: AArch64\n\n");
 
-              print("[ OK ] Pebble kernel\n");
-              print("[ OK ] UART\n");
-              print("[ OK ] Boulder allocator\n");
-              print("[ OK ] Pebble RAM filesystem\n");
-              print("[ OK ] Stone 0.1\n\n");
+              print("[ OK ] Pebble Kernel EL1\n");
+              print("[ OK ] Exception vectors\n");
+              print("[ OK ] SVC syscall gate\n");
+              print("[ OK ] PEX v1 loader\n");
+              print("[ OK ] Chalk Guardian\n\n");
 
-              print("Type 'help' for commands.\n");
+              /*
+               * First prove Chalk blocks the suspicious PEX.
+               */
+              chalk_scan(&sus_pex);
 
-              for (;;) {
-                  stone_prompt();
-                  read_command();
-                  stone_execute();
-              }
+              print("\nLaunching hello.px...\n");
+
+              /*
+               * hello.px is our actual EL0 proof.
+               *
+               * chip.px is included as a second PEX image;
+               * proper process-return/context switching lands
+               * in the next Quarry update.
+               */
+              launch_pex(&hello_pex);
           }
           EOF
+
+          # ============================================
+          # LINKER
+          # ============================================
 
           cat > src/linker.ld <<'EOF'
           ENTRY(_start)
@@ -528,23 +634,23 @@ jobs:
           {
               . = 0x40080000;
 
-              .text : ALIGN(16)
+              .text : ALIGN(4096)
               {
                   KEEP(*(.text.boot))
                   *(.text*)
               }
 
-              .rodata : ALIGN(16)
+              .rodata : ALIGN(4096)
               {
                   *(.rodata*)
               }
 
-              .data : ALIGN(16)
+              .data : ALIGN(4096)
               {
                   *(.data*)
               }
 
-              .bss : ALIGN(16)
+              .bss : ALIGN(4096)
               {
                   __bss_start = .;
                   *(.bss*)
@@ -554,95 +660,117 @@ jobs:
           }
           EOF
 
-      - name: 🔥 Compile Boulder
+      - name: 🔥 Compile Quarry
         run: |
-          aarch64-linux-gnu-gcc \
-            -c src/boot.S \
-            -o build/boot.o \
-            -ffreestanding
+          COMMON="-ffreestanding -fno-stack-protector -fno-pie -nostdlib"
 
-          aarch64-linux-gnu-gcc \
-            -c src/kernel.c \
-            -o build/kernel.o \
-            -ffreestanding \
-            -fno-stack-protector \
-            -fno-pie \
-            -nostdlib \
+          aarch64-linux-gnu-gcc $COMMON \
+            -c src/boot.S \
+            -o build/boot.o
+
+          aarch64-linux-gnu-gcc $COMMON \
+            -c src/vectors.S \
+            -o build/vectors.o
+
+          aarch64-linux-gnu-gcc $COMMON \
+            -c src/users.S \
+            -o build/users.o
+
+          aarch64-linux-gnu-gcc $COMMON \
             -O2 \
             -Wall \
-            -Wextra
+            -Wextra \
+            -c src/kernel.c \
+            -o build/kernel.o
 
           aarch64-linux-gnu-ld \
             -T src/linker.ld \
             build/boot.o \
+            build/vectors.o \
+            build/users.o \
             build/kernel.o \
             -o build/pebble.elf
 
+          echo "🪨 Quarry compiled"
           file build/pebble.elf
           ls -lh build/pebble.elf
 
-      - name: 🧪 Talk to Stone
+      - name: 🧪 Boot Quarry
         run: |
           set +e
 
-          {
-            sleep 1
-            echo "about"
-            echo "memory"
-            echo "ls"
-            echo "touch nugget.txt"
-            echo "write nugget.txt chicken nugget"
-            echo "read nugget.txt"
-            echo "chicken nugget"
-            echo "linux"
-            echo "help"
-          } | timeout 6s qemu-system-aarch64 \
-              -M virt \
-              -cpu cortex-a53 \
-              -m 128M \
-              -nographic \
-              -kernel build/pebble.elf \
-              > build/boot.log 2>&1
+          timeout 5s qemu-system-aarch64 \
+            -M virt \
+            -cpu cortex-a53 \
+            -m 128M \
+            -nographic \
+            -kernel build/pebble.elf \
+            > build/boot.log 2>&1
 
           set -e
 
           cat build/boot.log
 
-          grep -q 'Pebble 0.1.0 "Boulder"' build/boot.log
-          grep -q "No Linux underneath." build/boot.log
-          grep -q "written 14 bytes" build/boot.log
-          grep -q "chicken nugget" build/boot.log
-          grep -q "stone: delicious." build/boot.log
-          grep -q "stone: what is a linux" build/boot.log
+          echo ""
+          echo "====== QUARRY TESTS ======"
+
+          grep -q 'Pebble 0.2.0 "Quarry"' build/boot.log
+          echo "✓ Pebble booted"
+
+          grep -q "CHALK: BLOCKED" build/boot.log
+          echo "✓ Chalk blocked dangerous PEX"
+
+          grep -q "CHALK: CLEAR" build/boot.log
+          echo "✓ Chalk cleared hello.px"
+
+          grep -q "PEX: entering EL0" build/boot.log
+          echo "✓ PEX loader entered userspace"
+
+          grep -q "Hello from Pebble userspace" build/boot.log
+          echo "✓ hello.px executed"
+
+          grep -q "CurrentEL = EL0" build/boot.log
+          echo "✓ REAL EL0 CONFIRMED"
+
+          grep -q "write syscall = OK" build/boot.log
+          echo "✓ SVC syscall succeeded"
+
+          grep -q "exit code 0" build/boot.log
+          echo "✓ userspace exited cleanly"
 
           echo ""
-          echo "🪨🔥 BOULDER SURVIVED THE TEST"
+          echo "🪨🔥 QUARRY LIVES"
 
-      - name: 📦 Prepare Boulder
+      - name: 📦 Package Quarry
         run: |
           cp build/pebble.elf release/pebble-aarch64.elf
           cp build/boot.log release/boot.log
 
           cat > release/README.txt <<'EOF'
-          Pebble 0.1.0 "Boulder"
+          Pebble 0.2.0 "Quarry"
 
-          Native AArch64 hobby operating system.
+          Architecture: AArch64
+          Target: QEMU virt
 
-          Includes:
-          - Pebble kernel
-          - PL011 UART input/output
-          - Boulder bump allocator
-          - RAM filesystem
-          - Stone 0.1 command environment
+          New foundations:
+          - EL1 Pebble kernel
+          - EL0 Pebble userspace
+          - AArch64 exception vectors
+          - SVC syscall gate
+          - PEX v1 executable container
+          - Chalk Guardian capability scanning
+          - hello.px userspace test
+          - chip.px payload
 
-          Target:
-          QEMU virt / AArch64
+          Important:
+          Quarry establishes CPU privilege separation.
+          Full virtual-memory isolation is still upcoming.
 
-          The rock got bigger.
+          The rock learned to run programs.
           EOF
 
-      - name: ⬆️ Upload Boulder
+      - name: ⬆️ Upload Quarry
         uses: actions/upload-artifact@v4
         with:
-          name: pebble-0.1.0-boulder
+          name: pebble-0.2.0-quarry
           path: release/
