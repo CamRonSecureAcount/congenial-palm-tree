@@ -591,10 +591,76 @@ jobs:
               }
           }
           EOF
+          
+      - name: 🏝️ Cook Pebble Shore
+        shell: bash
+        run: |
+          set -e
 
+          mkdir -p build/wallpaper
+          WALLPAPER="assets/IMG_1526.gif"
+
+          echo "========================================"
+          echo "       PEBBLE WALLPAPER KITCHEN"
+          echo "========================================"
+
+          if [ ! -f "$WALLPAPER" ]; then
+            echo "💀 WHERE THE FUCK IS THE BEACH"
+            echo "Expected: $WALLPAPER"
+            exit 1
+          fi
+
+          echo "🏝️ Found IMG_1526.gif"
+
+          FRAMES=$(identify "$WALLPAPER" | wc -l)
+
+          echo "🎞️ GIF frames: $FRAMES"
+          echo "🪨 Converting beach into rocks..."
+
+          magick "$WALLPAPER" \
+            -coalesce \
+            -resize '640x480!' \
+            -colors 256 \
+            'build/wallpaper/frame-%03d.png'
+
+          FRAME_COUNT=$(find build/wallpaper -name 'frame-*.png' | wc -l)
+
+          echo "✓ Produced $FRAME_COUNT Slate frames"
+
+          magick build/wallpaper/frame-000.png \
+            -depth 8 \
+            RGB:build/wallpaper/boot.rgb
+
+          printf '%s\n' \
+            'PWAL' \
+            'name=Pebble Shore' \
+            'source=IMG_1526.gif' \
+            'width=640' \
+            'height=480' \
+            "frames=$FRAME_COUNT" \
+            'animated=true' \
+            > build/wallpaper/wallpaper.meta
+
+          echo ""
+          echo "🏝️ Pebble Shore cooked."
+          echo "Chip: BEACH EPISODE 🔥"
+
+      - name: 🪨 Embed Slate assets
+        shell: bash
+        run: |
+          set -e
+
+          echo "🪨 Embedding Pebble Shore..."
+
+          xxd -i build/wallpaper/boot.rgb \
+            > build/wallpaper/boot_wallpaper.h
+
+          echo "✓ Generated boot_wallpaper.h"
+          echo "🏝️ Beach successfully converted into C nonsense."
+          
       - name: 🔥 Compile Stoneyard
         run: |
-          COMMON="-ffreestanding -fno-stack-protector -fno-pie -nostdlib"
+       COMMON="-ffreestanding -fno-stack-protector -fno-pie -nostdlib"
 
           aarch64-linux-gnu-gcc $COMMON \
             -c src/boot.S \
