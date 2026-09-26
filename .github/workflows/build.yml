@@ -1,4 +1,4 @@
-name: "🪨 Build Pebble"
+name: "🪨 Pebble 0.1.0 — Boulder"
 
 on:
   workflow_dispatch:
@@ -13,35 +13,40 @@ jobs:
       - name: 🪨 Checkout
         uses: actions/checkout@v4
 
-      - name: 🔧 Install Pebble tools
+      - name: 🔧 Install tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            qemu-system-arm
 
-      # =========================================================
-      # SETIN LAZINESS ENGINE™
-      # Generate Pebble's source inside the runner.
-      # =========================================================
-
-      - name: 🧱 Generate Pebble source
+      - name: 🧱 Generate Pebble
         run: |
-          mkdir -p pebble-src
+          mkdir -p src build release
 
-          cat > pebble-src/boot.S <<'EOF'
+          cat > src/boot.S <<'EOF'
           .section ".text.boot"
           .global _start
 
           _start:
-              // Only let CPU 0 continue.
               mrs x0, mpidr_el1
               and x0, x0, #0xff
               cbnz x0, halt
 
-              // Set our stack.
               ldr x0, =stack_top
               mov sp, x0
 
-              // Enter Pebble.
+              ldr x0, =__bss_start
+              ldr x1, =__bss_end
+
+          clear_bss:
+              cmp x0, x1
+              b.hs start_kernel
+              str xzr, [x0], #8
+              b clear_bss
+
+          start_kernel:
               bl pebble_main
 
           halt:
@@ -50,73 +55,473 @@ jobs:
 
           .section ".bss"
           .align 12
-
           stack_bottom:
-              .skip 16384
-
+              .skip 32768
           stack_top:
           EOF
 
-          cat > pebble-src/kernel.c <<'EOF'
-          typedef unsigned int u32;
+          cat > src/kernel.c <<'EOF'
+          typedef unsigned long u64;
+          typedef unsigned int  u32;
+          typedef unsigned long usize;
 
-          /*
-           * PL011 UART provided by QEMU's ARM "virt" machine.
-           */
+          /* =========================================
+             UART — QEMU PL011
+             ========================================= */
+
           #define UART_BASE 0x09000000UL
-
           #define UART_DR (*(volatile u32 *)(UART_BASE + 0x00))
           #define UART_FR (*(volatile u32 *)(UART_BASE + 0x18))
 
-          static void pebble_putc(char c)
+          static void putc(char c)
           {
-              while (UART_FR & (1u << 5)) {
-                  /* wait */
+              while (UART_FR & (1u << 5)) {}
+
+              if (c == '\n') {
+                  UART_DR = '\r';
+                  while (UART_FR & (1u << 5)) {}
               }
 
               UART_DR = (u32)c;
           }
 
-          static void pebble_print(const char *text)
+          static char getc(void)
           {
-              while (*text) {
-                  if (*text == '\n')
-                      pebble_putc('\r');
+              while (UART_FR & (1u << 4)) {}
+              return (char)(UART_DR & 0xff);
+          }
 
-                  pebble_putc(*text++);
+          static void print(const char *s)
+          {
+              while (*s)
+                  putc(*s++);
+          }
+
+          /* =========================================
+             Tiny string library
+             ========================================= */
+
+          static int strcmp(const char *a, const char *b)
+          {
+              while (*a && (*a == *b)) {
+                  a++;
+                  b++;
+              }
+
+              return *(const unsigned char *)a -
+                     *(const unsigned char *)b;
+          }
+
+          static int starts(const char *s, const char *prefix)
+          {
+              while (*prefix) {
+                  if (*s++ != *prefix++)
+                      return 0;
+              }
+
+              return 1;
+          }
+
+          static void strcpy(char *dst, const char *src)
+          {
+              while ((*dst++ = *src++)) {}
+          }
+
+          static usize strlen(const char *s)
+          {
+              usize n = 0;
+
+              while (*s++)
+                  n++;
+
+              return n;
+          }
+
+          static void print_number(u64 n)
+          {
+              char buf[32];
+              int i = 0;
+
+              if (n == 0) {
+                  putc('0');
+                  return;
+              }
+
+              while (n) {
+                  buf[i++] = '0' + (n % 10);
+                  n /= 10;
+              }
+
+              while (i)
+                  putc(buf[--i]);
+          }
+
+          /* =========================================
+             Boulder memory allocator
+             ========================================= */
+
+          #define HEAP_SIZE (256 * 1024)
+
+          static unsigned char heap[HEAP_SIZE];
+          static usize heap_used = 0;
+
+          static void *pebble_alloc(usize bytes)
+          {
+              bytes = (bytes + 15) & ~15UL;
+
+              if (heap_used + bytes > HEAP_SIZE)
+                  return 0;
+
+              void *result = &heap[heap_used];
+              heap_used += bytes;
+
+              return result;
+          }
+
+          /* =========================================
+             Pebble RAM filesystem
+             ========================================= */
+
+          #define MAX_FILES 32
+          #define NAME_SIZE 32
+          #define DATA_SIZE 256
+
+          struct file {
+              int used;
+              int directory;
+
+              char name[NAME_SIZE];
+              char data[DATA_SIZE];
+          };
+
+          static struct file files[MAX_FILES];
+
+          static struct file *find_file(const char *name)
+          {
+              int i;
+
+              for (i = 0; i < MAX_FILES; i++) {
+                  if (files[i].used &&
+                      strcmp(files[i].name, name) == 0)
+                      return &files[i];
+              }
+
+              return 0;
+          }
+
+          static struct file *create_file(
+              const char *name,
+              int directory
+          )
+          {
+              int i;
+
+              if (find_file(name))
+                  return 0;
+
+              for (i = 0; i < MAX_FILES; i++) {
+                  if (!files[i].used) {
+                      files[i].used = 1;
+                      files[i].directory = directory;
+
+                      strcpy(files[i].name, name);
+                      files[i].data[0] = 0;
+
+                      return &files[i];
+                  }
+              }
+
+              return 0;
+          }
+
+          static void fs_init(void)
+          {
+              struct file *f;
+
+              create_file("system", 1);
+              create_file("home", 1);
+
+              f = create_file("welcome.txt", 0);
+
+              if (f)
+                  strcpy(
+                      f->data,
+                      "Welcome to Pebble. The rock lives."
+                  );
+          }
+
+          static void list_files(void)
+          {
+              int i;
+
+              for (i = 0; i < MAX_FILES; i++) {
+                  if (!files[i].used)
+                      continue;
+
+                  if (files[i].directory)
+                      print("[dir]  ");
+                  else
+                      print("[file] ");
+
+                  print(files[i].name);
+                  print("\n");
               }
           }
 
-          void pebble_main(void)
+          /* =========================================
+             Stone
+             ========================================= */
+
+          #define COMMAND_SIZE 256
+
+          static char command[COMMAND_SIZE];
+
+          static void stone_prompt(void)
           {
-              pebble_print("\n");
-              pebble_print("====================================\n");
-              pebble_print("          P E B B L E\n");
-              pebble_print("====================================\n");
-              pebble_print("\n");
-              pebble_print("Pebble 0.0.1 - Rock\n");
-              pebble_print("Architecture: AArch64\n");
-              pebble_print("\n");
+              print("\nstone ::> ");
+          }
 
-              pebble_print("[ OK ] Pebble kernel entered\n");
-              pebble_print("[ OK ] UART online\n");
-              pebble_print("[ OK ] Core 0 online\n");
-
-              pebble_print("\n");
-              pebble_print("No Linux.\n");
-              pebble_print("No distro underneath.\n");
-              pebble_print("Just Pebble.\n");
-              pebble_print("\n");
-
-              pebble_print("The rock lives.\n");
+          static void read_command(void)
+          {
+              int i = 0;
 
               for (;;) {
-                  __asm__ volatile("wfe");
+                  char c = getc();
+
+                  if (c == '\r' || c == '\n') {
+                      putc('\n');
+                      command[i] = 0;
+                      return;
+                  }
+
+                  if ((c == 8 || c == 127) && i > 0) {
+                      i--;
+                      print("\b \b");
+                      continue;
+                  }
+
+                  if (c >= 32 && c <= 126 &&
+                      i < COMMAND_SIZE - 1) {
+
+                      command[i++] = c;
+                      putc(c);
+                  }
+              }
+          }
+
+          static void stone_help(void)
+          {
+              print(
+                  "\n"
+                  "Stone commands\n"
+                  "--------------\n"
+                  "help               show commands\n"
+                  "about              about Pebble\n"
+                  "clear              clear screen\n"
+                  "echo <text>         print text\n"
+                  "memory              heap information\n"
+                  "ls                  list RAM objects\n"
+                  "touch <name>        create file\n"
+                  "mkdir <name>        create directory\n"
+                  "write <file> <txt>  write file\n"
+                  "read <file>         read file\n"
+                  "reboot              reboot Pebble\n"
+              );
+          }
+
+          static void stone_execute(void)
+          {
+              if (!command[0])
+                  return;
+
+              if (strcmp(command, "help") == 0) {
+                  stone_help();
+              }
+
+              else if (strcmp(command, "about") == 0) {
+                  print(
+                      "Pebble 0.1.0 \"Boulder\"\n"
+                      "Architecture: AArch64\n"
+                      "Kernel: Pebble\n"
+                      "Shell: Stone 0.1\n"
+                      "No Linux underneath.\n"
+                  );
+              }
+
+              else if (strcmp(command, "ls") == 0) {
+                  list_files();
+              }
+
+              else if (strcmp(command, "memory") == 0) {
+                  print("Heap used: ");
+                  print_number(heap_used);
+
+                  print(" / ");
+                  print_number(HEAP_SIZE);
+
+                  print(" bytes\n");
+              }
+
+              else if (strcmp(command, "clear") == 0) {
+                  print("\033[2J\033[H");
+              }
+
+              else if (starts(command, "echo ")) {
+                  print(command + 5);
+                  print("\n");
+              }
+
+              else if (starts(command, "touch ")) {
+                  const char *name = command + 6;
+
+                  if (!*name) {
+                      print("stone: missing filename\n");
+                  }
+                  else if (create_file(name, 0)) {
+                      print("created ");
+                      print(name);
+                      print("\n");
+                  }
+                  else {
+                      print("stone: could not create file\n");
+                  }
+              }
+
+              else if (starts(command, "mkdir ")) {
+                  const char *name = command + 6;
+
+                  if (!*name) {
+                      print("stone: missing directory name\n");
+                  }
+                  else if (create_file(name, 1)) {
+                      print("created directory ");
+                      print(name);
+                      print("\n");
+                  }
+                  else {
+                      print("stone: could not create directory\n");
+                  }
+              }
+
+              else if (starts(command, "read ")) {
+                  const char *name = command + 5;
+                  struct file *f = find_file(name);
+
+                  if (!f) {
+                      print("stone: file not found\n");
+                  }
+                  else if (f->directory) {
+                      print("stone: that's a directory\n");
+                  }
+                  else {
+                      print(f->data);
+                      print("\n");
+                  }
+              }
+
+              else if (starts(command, "write ")) {
+                  char *p = command + 6;
+                  char *name = p;
+
+                  while (*p && *p != ' ')
+                      p++;
+
+                  if (!*p) {
+                      print("usage: write <file> <text>\n");
+                  }
+                  else {
+                      *p++ = 0;
+
+                      struct file *f = find_file(name);
+
+                      if (!f) {
+                          print("stone: file not found\n");
+                      }
+                      else if (f->directory) {
+                          print("stone: cannot write directory\n");
+                      }
+                      else if (strlen(p) >= DATA_SIZE) {
+                          print("stone: text too large\n");
+                      }
+                      else {
+                          strcpy(f->data, p);
+
+                          print("written ");
+                          print_number(strlen(p));
+                          print(" bytes\n");
+                      }
+                  }
+              }
+
+              else if (strcmp(command, "linux") == 0) {
+                  print("stone: what is a linux\n");
+              }
+
+              else if (strcmp(command, "chicken nugget") == 0) {
+                  print("stone: delicious.\n");
+              }
+
+              else if (strcmp(command, "reboot") == 0) {
+                  print("stone: reboot requested\n");
+
+                  /*
+                   * QEMU virt power controller.
+                   */
+                  *(volatile u32 *)0x09020000 = 0x7777;
+              }
+
+              else {
+                  print("stone: unknown command: ");
+                  print(command);
+                  print("\n");
+              }
+          }
+
+          /* =========================================
+             Pebble kernel
+             ========================================= */
+
+          void pebble_main(void)
+          {
+              /*
+               * Prove our allocator actually works.
+               */
+              void *test = pebble_alloc(64);
+
+              if (!test) {
+                  print("PANIC: allocator failed\n");
+
+                  for (;;)
+                      __asm__ volatile("wfe");
+              }
+
+              fs_init();
+
+              print("\n");
+              print("====================================\n");
+              print("              PEBBLE\n");
+              print("====================================\n\n");
+
+              print("Pebble 0.1.0 \"Boulder\"\n");
+              print("Architecture: AArch64\n\n");
+
+              print("[ OK ] Pebble kernel\n");
+              print("[ OK ] UART\n");
+              print("[ OK ] Boulder allocator\n");
+              print("[ OK ] Pebble RAM filesystem\n");
+              print("[ OK ] Stone 0.1\n\n");
+
+              print("Type 'help' for commands.\n");
+
+              for (;;) {
+                  stone_prompt();
+                  read_command();
+                  stone_execute();
               }
           }
           EOF
 
-          cat > pebble-src/linker.ld <<'EOF'
+          cat > src/linker.ld <<'EOF'
           ENTRY(_start)
 
           SECTIONS
@@ -141,92 +546,103 @@ jobs:
 
               .bss : ALIGN(16)
               {
+                  __bss_start = .;
                   *(.bss*)
                   *(COMMON)
+                  __bss_end = .;
               }
           }
           EOF
 
-      - name: 🔥 Compile Pebble
+      - name: 🔥 Compile Boulder
         run: |
-          mkdir -p build
+          aarch64-linux-gnu-gcc \
+            -c src/boot.S \
+            -o build/boot.o \
+            -ffreestanding
 
           aarch64-linux-gnu-gcc \
-            -c pebble-src/boot.S \
-            -o build/boot.o
-
-          aarch64-linux-gnu-gcc \
-            -c pebble-src/kernel.c \
+            -c src/kernel.c \
             -o build/kernel.o \
             -ffreestanding \
             -fno-stack-protector \
             -fno-pie \
             -nostdlib \
-            -O2
+            -O2 \
+            -Wall \
+            -Wextra
 
           aarch64-linux-gnu-ld \
-            -T pebble-src/linker.ld \
+            -T src/linker.ld \
             build/boot.o \
             build/kernel.o \
             -o build/pebble.elf
 
-          echo "🪨 Pebble compiled!"
           file build/pebble.elf
           ls -lh build/pebble.elf
 
-      - name: 🧪 Boot the rock
+      - name: 🧪 Talk to Stone
         run: |
           set +e
 
-          timeout 5s qemu-system-aarch64 \
-            -M virt \
-            -cpu cortex-a53 \
-            -m 128M \
-            -nographic \
-            -kernel build/pebble.elf \
-            > build/boot.log 2>&1
+          {
+            sleep 1
+            echo "about"
+            echo "memory"
+            echo "ls"
+            echo "touch nugget.txt"
+            echo "write nugget.txt chicken nugget"
+            echo "read nugget.txt"
+            echo "chicken nugget"
+            echo "linux"
+            echo "help"
+          } | timeout 6s qemu-system-aarch64 \
+              -M virt \
+              -cpu cortex-a53 \
+              -m 128M \
+              -nographic \
+              -kernel build/pebble.elf \
+              > build/boot.log 2>&1
 
           set -e
 
-          echo ""
-          echo "========= PEBBLE OUTPUT ========="
           cat build/boot.log
-          echo "================================="
 
-          if grep -q "The rock lives." build/boot.log; then
-            echo "🪨🔥 PEBBLE BOOTED SUCCESSFULLY"
-          else
-            echo "💀 THE ROCK DID NOT LIVE"
-            exit 1
-          fi
+          grep -q 'Pebble 0.1.0 "Boulder"' build/boot.log
+          grep -q "No Linux underneath." build/boot.log
+          grep -q "written 14 bytes" build/boot.log
+          grep -q "chicken nugget" build/boot.log
+          grep -q "stone: delicious." build/boot.log
+          grep -q "stone: what is a linux" build/boot.log
 
-      - name: 📦 Prepare Rock
+          echo ""
+          echo "🪨🔥 BOULDER SURVIVED THE TEST"
+
+      - name: 📦 Prepare Boulder
         run: |
-          mkdir -p release
-
           cp build/pebble.elf release/pebble-aarch64.elf
           cp build/boot.log release/boot.log
 
           cat > release/README.txt <<'EOF'
-          Pebble 0.0.1 "Rock"
+          Pebble 0.1.0 "Boulder"
 
-          Architecture:
-              AArch64
+          Native AArch64 hobby operating system.
 
-          Machine:
-              QEMU virt
+          Includes:
+          - Pebble kernel
+          - PL011 UART input/output
+          - Boulder bump allocator
+          - RAM filesystem
+          - Stone 0.1 command environment
 
-          Contents:
-              pebble-aarch64.elf
-              boot.log
+          Target:
+          QEMU virt / AArch64
 
-          This is the first bootable Pebble kernel.
-
-          The rock lives.
+          The rock got bigger.
           EOF
 
-      - name: ⬆️ Upload Pebble
+      - name: ⬆️ Upload Boulder
         uses: actions/upload-artifact@v4
         with:
-          name: pebble-0.0.1-rock
+          name: pebble-0.1.0-boulder
           path: release/
