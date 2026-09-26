@@ -1,0 +1,232 @@
+name: "🪨 Build Pebble"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+
+jobs:
+  build-pebble:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: 🪨 Checkout
+        uses: actions/checkout@v4
+
+      - name: 🔧 Install Pebble tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu qemu-system-arm
+
+      # =========================================================
+      # SETIN LAZINESS ENGINE™
+      # Generate Pebble's source inside the runner.
+      # =========================================================
+
+      - name: 🧱 Generate Pebble source
+        run: |
+          mkdir -p pebble-src
+
+          cat > pebble-src/boot.S <<'EOF'
+          .section ".text.boot"
+          .global _start
+
+          _start:
+              // Only let CPU 0 continue.
+              mrs x0, mpidr_el1
+              and x0, x0, #0xff
+              cbnz x0, halt
+
+              // Set our stack.
+              ldr x0, =stack_top
+              mov sp, x0
+
+              // Enter Pebble.
+              bl pebble_main
+
+          halt:
+              wfe
+              b halt
+
+          .section ".bss"
+          .align 12
+
+          stack_bottom:
+              .skip 16384
+
+          stack_top:
+          EOF
+
+          cat > pebble-src/kernel.c <<'EOF'
+          typedef unsigned int u32;
+
+          /*
+           * PL011 UART provided by QEMU's ARM "virt" machine.
+           */
+          #define UART_BASE 0x09000000UL
+
+          #define UART_DR (*(volatile u32 *)(UART_BASE + 0x00))
+          #define UART_FR (*(volatile u32 *)(UART_BASE + 0x18))
+
+          static void pebble_putc(char c)
+          {
+              while (UART_FR & (1u << 5)) {
+                  /* wait */
+              }
+
+              UART_DR = (u32)c;
+          }
+
+          static void pebble_print(const char *text)
+          {
+              while (*text) {
+                  if (*text == '\n')
+                      pebble_putc('\r');
+
+                  pebble_putc(*text++);
+              }
+          }
+
+          void pebble_main(void)
+          {
+              pebble_print("\n");
+              pebble_print("====================================\n");
+              pebble_print("          P E B B L E\n");
+              pebble_print("====================================\n");
+              pebble_print("\n");
+              pebble_print("Pebble 0.0.1 - Rock\n");
+              pebble_print("Architecture: AArch64\n");
+              pebble_print("\n");
+
+              pebble_print("[ OK ] Pebble kernel entered\n");
+              pebble_print("[ OK ] UART online\n");
+              pebble_print("[ OK ] Core 0 online\n");
+
+              pebble_print("\n");
+              pebble_print("No Linux.\n");
+              pebble_print("No distro underneath.\n");
+              pebble_print("Just Pebble.\n");
+              pebble_print("\n");
+
+              pebble_print("The rock lives.\n");
+
+              for (;;) {
+                  __asm__ volatile("wfe");
+              }
+          }
+          EOF
+
+          cat > pebble-src/linker.ld <<'EOF'
+          ENTRY(_start)
+
+          SECTIONS
+          {
+              . = 0x40080000;
+
+              .text : ALIGN(16)
+              {
+                  KEEP(*(.text.boot))
+                  *(.text*)
+              }
+
+              .rodata : ALIGN(16)
+              {
+                  *(.rodata*)
+              }
+
+              .data : ALIGN(16)
+              {
+                  *(.data*)
+              }
+
+              .bss : ALIGN(16)
+              {
+                  *(.bss*)
+                  *(COMMON)
+              }
+          }
+          EOF
+
+      - name: 🔥 Compile Pebble
+        run: |
+          mkdir -p build
+
+          aarch64-linux-gnu-gcc \
+            -c pebble-src/boot.S \
+            -o build/boot.o
+
+          aarch64-linux-gnu-gcc \
+            -c pebble-src/kernel.c \
+            -o build/kernel.o \
+            -ffreestanding \
+            -fno-stack-protector \
+            -fno-pie \
+            -nostdlib \
+            -O2
+
+          aarch64-linux-gnu-ld \
+            -T pebble-src/linker.ld \
+            build/boot.o \
+            build/kernel.o \
+            -o build/pebble.elf
+
+          echo "🪨 Pebble compiled!"
+          file build/pebble.elf
+          ls -lh build/pebble.elf
+
+      - name: 🧪 Boot the rock
+        run: |
+          set +e
+
+          timeout 5s qemu-system-aarch64 \
+            -M virt \
+            -cpu cortex-a53 \
+            -m 128M \
+            -nographic \
+            -kernel build/pebble.elf \
+            > build/boot.log 2>&1
+
+          set -e
+
+          echo ""
+          echo "========= PEBBLE OUTPUT ========="
+          cat build/boot.log
+          echo "================================="
+
+          if grep -q "The rock lives." build/boot.log; then
+            echo "🪨🔥 PEBBLE BOOTED SUCCESSFULLY"
+          else
+            echo "💀 THE ROCK DID NOT LIVE"
+            exit 1
+          fi
+
+      - name: 📦 Prepare Rock
+        run: |
+          mkdir -p release
+
+          cp build/pebble.elf release/pebble-aarch64.elf
+          cp build/boot.log release/boot.log
+
+          cat > release/README.txt <<'EOF'
+          Pebble 0.0.1 "Rock"
+
+          Architecture:
+              AArch64
+
+          Machine:
+              QEMU virt
+
+          Contents:
+              pebble-aarch64.elf
+              boot.log
+
+          This is the first bootable Pebble kernel.
+
+          The rock lives.
+          EOF
+
+      - name: ⬆️ Upload Pebble
+        uses: actions/upload-artifact@v4
+        with:
+          name: pebble-0.0.1-rock
+          path: release/
