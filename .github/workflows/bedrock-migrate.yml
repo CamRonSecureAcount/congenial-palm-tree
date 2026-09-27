@@ -1,0 +1,175 @@
+name: "🪨 Pebble 1.0 — Bedrock Migration"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  migrate:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📦 Checkout Pebble"
+        uses: actions/checkout@v4
+
+      - name: "🪨 Extract Pebble from the YAML dimension"
+        shell: python
+        run: |
+          from pathlib import Path
+          import re
+
+          workflow = Path(".github/workflows/build.yml")
+          text = workflow.read_text()
+
+          Path("src").mkdir(exist_ok=True)
+
+          # Find the heredocs from our known-good Pebble 0.5 workflow.
+          targets = {
+              "src/boot.S": r"cat > src/boot\.S <<'EOF'\n(.*?)\n\s*EOF",
+              "src/kernel.c": r"cat > src/kernel\.c <<'EOF'\n(.*?)\n\s*EOF",
+              "src/linker.ld": r"cat > src/linker\.ld <<'EOF'\n(.*?)\n\s*EOF",
+          }
+
+          for filename, pattern in targets.items():
+              match = re.search(pattern, text, re.S)
+
+              if not match:
+                  raise SystemExit(
+                      f"💀 Couldn't extract {filename}"
+                  )
+
+              # Workflow block scalars indent the generated files.
+              lines = match.group(1).splitlines()
+
+              nonempty = [
+                  line for line in lines
+                  if line.strip()
+              ]
+
+              if nonempty:
+                  indent = min(
+                      len(line) - len(line.lstrip())
+                      for line in nonempty
+                  )
+              else:
+                  indent = 0
+
+              content = "\n".join(
+                  line[indent:]
+                  if len(line) >= indent
+                  else ""
+                  for line in lines
+              )
+
+              Path(filename).write_text(content + "\n")
+
+              print(
+                  f"🔥 Extracted {filename} "
+                  f"({len(content)} bytes)"
+              )
+
+          print()
+          print("🪨 PEBBLE HAS ESCAPED BUILD.YML")
+
+      - name: "🔎 Verify extracted source"
+        run: |
+          set -eux
+
+          test -s src/boot.S
+          test -s src/kernel.c
+          test -s src/linker.ld
+
+          grep -q "pebble_main" src/kernel.c
+          grep -q "ramfb_init" src/kernel.c
+          grep -q "chip_wakeup" src/kernel.c
+          grep -q "PEBBLE 0.5" src/kernel.c
+
+          echo ""
+          echo "========== SOURCE TREE =========="
+          find src -maxdepth 2 -type f -print
+          echo "================================="
+          echo ""
+
+          wc -l \
+            src/boot.S \
+            src/kernel.c \
+            src/linker.ld
+
+          echo ""
+          echo "🔥 Known-good Slate code preserved"
+
+      - name: "📝 Add Bedrock marker"
+        run: |
+          cat > BEDROCK.md <<'EOF'
+          # Pebble 1.0 — Bedrock
+
+          Pebble has escaped the YAML dimension.
+
+          ## Foundation
+
+          Pebble 0.5 Slate provided:
+
+          - AArch64 bare-metal boot
+          - QEMU fw_cfg
+          - RAMFB
+          - Slate graphics
+          - Pebble Shore
+          - Chip
+          - graphical lock screen
+
+          ## Bedrock target
+
+          Pebble 1.0 adds:
+
+          - real input
+          - movable pointer
+          - interactive lock screen
+          - Slate desktop
+          - Stone app
+          - Files
+          - Settings
+          - Stoneyard
+          - Chalk UI
+          - Amethyst persistence
+          - Rock Mode
+
+          ## Important
+
+          Do not casually remove:
+
+              -mgeneral-regs-only
+
+          We remember what happened last time.
+
+          Chip remembers too.
+          EOF
+
+      - name: "🚀 Commit Bedrock source tree"
+        run: |
+          set -eux
+
+          git config user.name "Pebble Builder"
+          git config user.email "pebble@users.noreply.github.com"
+
+          git add \
+            src/boot.S \
+            src/kernel.c \
+            src/linker.ld \
+            BEDROCK.md
+
+          if git diff --cached --quiet; then
+            echo "🪨 Nothing changed."
+            exit 0
+          fi
+
+          git commit \
+            -m "🪨 Begin Pebble 1.0 Bedrock"
+
+          git push
+
+          echo ""
+          echo "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥"
+          echo "  BEDROCK SOURCE CREATED"
+          echo "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥"
