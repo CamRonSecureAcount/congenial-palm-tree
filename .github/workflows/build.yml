@@ -30,10 +30,12 @@ jobs:
           echo "🔎 Looking for ramfb VGA BIOS..."
           find /usr/share -name 'vgabios-ramfb.bin' -print
 
-          test -f /usr/share/qemu/vgabios-ramfb.bin || {
-            echo "💀 seabios installed but vgabios-ramfb.bin is still missing"
-            exit 1
+          test -f /usr/share/seabios/vgabios-ramfb.bin || {
+          echo "💀 vgabios-ramfb.bin actually missing"
+          exit 1
           }
+
+          echo "🔥 ramfb VGA BIOS found"
 
           mkdir -p src build/wallpaper release
           
