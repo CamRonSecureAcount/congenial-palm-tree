@@ -26,11 +26,12 @@ jobs:
               print("🪨 Input code already installed.")
               raise SystemExit(0)
 
-          marker = "/* ======================================================\n             PEBBLE MAIN"
+# Find pebble_main() itself instead of depending on comment whitespace.
+marker = "void pebble_main(void)"
 
-          if marker not in s:
-              raise SystemExit("💀 Could not find Pebble main marker")
-
+if marker not in s:
+        raise SystemExit("💀 Could not find void pebble_main(void)")
+    
           driver = r'''
           /* ======================================================
              BEDROCK VIRTIO INPUT
@@ -608,10 +609,11 @@ jobs:
 
           '''
 
-          s = s.replace(
-              marker,
-              driver + "\n          " + marker
-          )
+s = s.replace(
+    marker,
+    driver + "\n\n" + marker,
+    1
+)
 
           old = '''              for (;;)
                   __asm__ volatile("wfe");
