@@ -1,0 +1,232 @@
+name: "🪨 Pebble 1.0 — Bedrock Alpha"
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "assets/**"
+      - ".github/workflows/bedrock.yml"
+
+jobs:
+  bedrock:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📦 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🔧 Install tools"
+        run: |
+          set -eux
+
+          sudo apt-get update
+
+          sudo apt-get install -y \
+            gcc-aarch64-linux-gnu \
+            binutils-aarch64-linux-gnu \
+            qemu-system-arm \
+            seabios \
+            imagemagick \
+            xxd \
+            socat
+
+          mkdir -p \
+            build/wallpaper \
+            release
+
+      - name: "🏝️ Build Pebble Shore"
+        run: |
+          set -eux
+
+          convert \
+            "assets/IMG_1526.gif[0]" \
+            -resize '640x480!' \
+            -alpha off \
+            build/wallpaper/shore.png
+
+          convert \
+            build/wallpaper/shore.png \
+            -depth 8 \
+            RGB:build/wallpaper/shore.rgb
+
+          test "$(
+            wc -c < build/wallpaper/shore.rgb
+          )" -eq 921600
+
+          xxd \
+            -i \
+            -n pebble_shore_rgb \
+            build/wallpaper/shore.rgb \
+            > src/pebble_shore.h
+
+      - name: "🔥 Compile Bedrock"
+        run: |
+          set -eux
+
+          COMMON="\
+          -ffreestanding \
+          -fno-stack-protector \
+          -fno-pie \
+          -nostdlib \
+          -mgeneral-regs-only"
+
+          aarch64-linux-gnu-gcc \
+            $COMMON \
+            -c src/boot.S \
+            -o build/boot.o
+
+          aarch64-linux-gnu-gcc \
+            $COMMON \
+            -O2 \
+            -Wall \
+            -Wextra \
+            -Isrc \
+            -c src/kernel.c \
+            -o build/kernel.o
+
+          aarch64-linux-gnu-ld \
+            -T src/linker.ld \
+            build/boot.o \
+            build/kernel.o \
+            -o build/pebble-bedrock.elf
+
+          file build/pebble-bedrock.elf
+
+          ls -lh \
+            build/pebble-bedrock.elf
+
+      - name: "🖥️ Boot Bedrock"
+        continue-on-error: true
+        run: |
+          set +e
+
+          rm -f \
+            build/qemu-monitor.sock \
+            build/boot.log \
+            build/qemu.log \
+            release/bedrock.ppm
+
+          qemu-system-aarch64 \
+            -L /usr/share/seabios \
+            -M virt \
+            -cpu cortex-a53 \
+            -m 128M \
+            -kernel build/pebble-bedrock.elf \
+            -device ramfb \
+            -device virtio-mouse-device \
+            -display none \
+            -serial file:build/boot.log \
+            -monitor unix:build/qemu-monitor.sock,server=on,wait=off \
+            2>build/qemu.log \
+            &
+
+          PID=$!
+
+          echo "QEMU PID: $PID"
+
+          #
+          # Give Chip time to discover the mouse.
+          #
+          sleep 15
+
+          echo ""
+          echo "========== PEBBLE =========="
+          cat build/boot.log 2>/dev/null || true
+
+          echo ""
+          echo "=========== QEMU ==========="
+          cat build/qemu.log 2>/dev/null || true
+
+          #
+          # Screenshot.
+          #
+          if [ -S build/qemu-monitor.sock ]; then
+            printf \
+              'screendump release/bedrock.ppm\nquit\n' \
+              | socat \
+                  -T 3 \
+                  STDIN \
+                  UNIX-CONNECT:build/qemu-monitor.sock \
+                  >/dev/null \
+                  2>&1 \
+              || true
+          fi
+
+          sleep 1
+
+          kill "$PID" \
+            2>/dev/null \
+            || true
+
+          wait "$PID" \
+            2>/dev/null \
+            || true
+
+      - name: "📸 Process Bedrock screenshot"
+        if: always()
+        run: |
+          set +e
+
+          if [ -s release/bedrock.ppm ]; then
+            convert \
+              release/bedrock.ppm \
+              release/bedrock.png
+
+            identify \
+              release/bedrock.png
+
+            echo "📸 THE CURSOR HAS BEEN PHOTOGRAPHED"
+          fi
+
+          cp \
+            build/boot.log \
+            release/boot.log \
+            2>/dev/null \
+            || true
+
+          cp \
+            build/qemu.log \
+            release/qemu.log \
+            2>/dev/null \
+            || true
+
+          cp \
+            build/pebble-bedrock.elf \
+            release/pebble-1.0-bedrock-alpha.elf \
+            2>/dev/null \
+            || true
+
+      - name: "⬆️ Upload Bedrock"
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pebble-1.0-bedrock-alpha
+          path: release/
+
+      - name: "🪨 Verdict"
+        if: always()
+        run: |
+          echo ""
+          echo "Last Pebble messages:"
+          tail -50 \
+            build/boot.log \
+            2>/dev/null \
+            || true
+
+          if grep -q \
+            "\[ OK \] Real pointer input" \
+            build/boot.log \
+            2>/dev/null; then
+
+            echo ""
+            echo "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥"
+            echo "   THE ROCK HAS A MOUSE"
+            echo "🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥🔥"
+            exit 0
+          fi
+
+          echo ""
+          echo "💀 Chip could not find the mouse."
+          exit 1
