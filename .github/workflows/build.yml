@@ -16,17 +16,27 @@ jobs:
       - name: "🔧 Install tools"
         run: |
           set -e
+
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
             qemu-system-arm \
+            seabios \
             imagemagick \
             xxd \
             socat
 
-          mkdir -p src build/wallpaper release
+          echo "🔎 Looking for ramfb VGA BIOS..."
+          find /usr/share -name 'vgabios-ramfb.bin' -print
 
+          test -f /usr/share/qemu/vgabios-ramfb.bin || {
+            echo "💀 seabios installed but vgabios-ramfb.bin is still missing"
+            exit 1
+          }
+
+          mkdir -p src build/wallpaper release
+          
       # ============================================================
       # WALLPAPER
       # ============================================================
