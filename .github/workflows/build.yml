@@ -1,4 +1,4 @@
-name: "🪨 Pebble 0.5.1 — Slate Graphics"
+name: "🪨 Pebble 0.5.2 — Slate Display Bring-Up"
 
 on:
   workflow_dispatch:
@@ -13,11 +13,16 @@ jobs:
       - name: "📦 Checkout"
         uses: actions/checkout@v4
 
+      # ============================================================
+      # TOOLS
+      # ============================================================
+
       - name: "🔧 Install tools"
         run: |
           set -e
 
           sudo apt-get update
+
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
@@ -27,18 +32,15 @@ jobs:
             xxd \
             socat
 
-          echo "🔎 Looking for ramfb VGA BIOS..."
+          mkdir -p src build/wallpaper release
+
+          echo "🔎 RAMFB BIOS:"
           find /usr/share -name 'vgabios-ramfb.bin' -print
 
-          test -f /usr/share/seabios/vgabios-ramfb.bin || {
-          echo "💀 vgabios-ramfb.bin actually missing"
-          exit 1
-          }
+          test -f /usr/share/seabios/vgabios-ramfb.bin
 
-          echo "🔥 ramfb VGA BIOS found"
+          echo "🔥 Toolchain ready"
 
-          mkdir -p src build/wallpaper release
-          
       # ============================================================
       # WALLPAPER
       # ============================================================
@@ -62,24 +64,29 @@ jobs:
             RGB:build/wallpaper/shore.rgb
 
           SIZE="$(wc -c < build/wallpaper/shore.rgb)"
+
           echo "Wallpaper bytes: $SIZE"
 
           test "$SIZE" -eq 921600
 
-          cd build/wallpaper
-          xxd -i shore.rgb > ../../src/pebble_shore.h
+          (
+            cd build/wallpaper
+            xxd -i shore.rgb > ../../src/pebble_shore.h
+          )
+
+          echo "🏝️ Pebble Shore ready"
 
       # ============================================================
       # GENERATE PEBBLE
       # ============================================================
 
-      - name: "🧱 Generate Slate Graphics"
+      - name: "🧱 Generate Pebble"
         run: |
           set -e
 
-          # --------------------------------------------------------
+          # ========================================================
           # BOOT
-          # --------------------------------------------------------
+          # ========================================================
 
           cat > src/boot.S <<'EOF'
           .section ".text.boot"
@@ -98,11 +105,12 @@ jobs:
 
           clear_bss:
               cmp x0, x1
-              b.hs kernel
+              b.hs enter_kernel
+
               str xzr, [x0], #8
               b clear_bss
 
-          kernel:
+          enter_kernel:
               bl pebble_main
 
           halt:
@@ -111,13 +119,15 @@ jobs:
 
           .section ".bss"
           .align 12
-          .skip 65536
+
+          stack_bottom:
+              .skip 65536
           stack_top:
           EOF
 
-          # --------------------------------------------------------
+          # ========================================================
           # LINKER
-          # --------------------------------------------------------
+          # ========================================================
 
           cat > src/linker.ld <<'EOF'
           ENTRY(_start)
@@ -145,69 +155,81 @@ jobs:
               .bss : ALIGN(4096)
               {
                   __bss_start = .;
+
                   *(.bss*)
                   *(COMMON)
+
                   __bss_end = .;
               }
 
+              . = ALIGN(4096);
               __kernel_end = .;
           }
           EOF
 
-          # --------------------------------------------------------
+          # ========================================================
           # KERNEL
-          # --------------------------------------------------------
+          # ========================================================
 
           cat > src/kernel.c <<'EOF'
-          typedef unsigned char      u8;
-          typedef unsigned short     u16;
-          typedef unsigned int       u32;
-          typedef unsigned long      u64;
-          typedef unsigned long      usize;
+          typedef unsigned char  u8;
+          typedef unsigned short u16;
+          typedef unsigned int   u32;
+          typedef unsigned long  u64;
+          typedef unsigned long  usize;
 
           #include "pebble_shore.h"
 
           /* ======================================================
-             HARDWARE
+             PEBBLE HARDWARE MAP
              ====================================================== */
 
           #define UART_BASE   0x09000000UL
           #define FWCFG_BASE  0x09020000UL
 
-          #define UART_DR (*(volatile u32 *)(UART_BASE + 0x00))
-          #define UART_FR (*(volatile u32 *)(UART_BASE + 0x18))
+          #define UART_DR \
+              (*(volatile u32 *)(UART_BASE + 0x00))
+
+          #define UART_FR \
+              (*(volatile u32 *)(UART_BASE + 0x18))
 
           /*
-           * Put framebuffer well above the kernel.
+           * QEMU virt RAM begins at 0x40000000.
            *
-           * QEMU virt RAM:
-           *   0x40000000 ...
-           *
-           * Pebble:
-           *   ~0x40080000
+           * Pebble ELF:
+           *   0x40080000
            *
            * Framebuffer:
            *   0x44000000
+           *
+           * 640 * 480 * 4 = 1,228,800 bytes
+           *
+           * With 128 MiB guest RAM this leaves us
+           * an absurd amount of breathing room.
            */
-          #define FB_ADDR   0x44000000UL
-          #define FB_WIDTH  640
-          #define FB_HEIGHT 480
-          #define FB_STRIDE (FB_WIDTH * 4)
 
-          static volatile u32 *fb =
+          #define FB_ADDR   0x44000000UL
+          #define FB_WIDTH  640U
+          #define FB_HEIGHT 480U
+          #define FB_STRIDE (FB_WIDTH * 4U)
+
+          static volatile u32 *const framebuffer =
               (volatile u32 *)FB_ADDR;
 
           /* ======================================================
              UART
              ====================================================== */
 
-          static void putc(char c)
+          static void uart_putc(char c)
           {
-              while (UART_FR & (1u << 5)) {}
+              while (UART_FR & (1U << 5)) {
+              }
 
               if (c == '\n') {
                   UART_DR = '\r';
-                  while (UART_FR & (1u << 5)) {}
+
+                  while (UART_FR & (1U << 5)) {
+                  }
               }
 
               UART_DR = (u32)c;
@@ -216,57 +238,87 @@ jobs:
           static void print(const char *s)
           {
               while (*s)
-                  putc(*s++);
+                  uart_putc(*s++);
           }
 
-          static void print_uint(u32 n)
+          static void print_u32(u32 value)
           {
-              char buf[16];
-              u32 i = 0;
+              char buffer[16];
+              u32 pos = 0;
 
-              if (!n) {
-                  putc('0');
+              if (value == 0) {
+                  uart_putc('0');
                   return;
               }
 
-              while (n) {
-                  buf[i++] = '0' + (n % 10);
-                  n /= 10;
+              while (value != 0) {
+                  buffer[pos++] =
+                      (char)('0' + (value % 10));
+
+                  value /= 10;
               }
 
-              while (i)
-                  putc(buf[--i]);
+              while (pos != 0)
+                  uart_putc(buffer[--pos]);
+          }
+
+          static void print_hex16(u16 value)
+          {
+              static const char hex[] =
+                  "0123456789ABCDEF";
+
+              int shift;
+
+              print("0x");
+
+              for (shift = 12; shift >= 0; shift -= 4)
+                  uart_putc(hex[(value >> shift) & 0xF]);
           }
 
           /* ======================================================
-             ENDIAN
+             ENDIAN HELPERS
              ====================================================== */
 
-          static u16 be16(u16 x)
+          static u16 cpu_to_be16(u16 value)
           {
-              return (u16)((x >> 8) | (x << 8));
+              return (u16)(
+                  (value >> 8) |
+                  (value << 8)
+              );
           }
 
-          static u32 be32(u32 x)
+          static u32 cpu_to_be32(u32 value)
           {
-              return __builtin_bswap32(x);
+              return __builtin_bswap32(value);
           }
 
-          static u64 be64(u64 x)
+          static u64 cpu_to_be64(u64 value)
           {
-              return __builtin_bswap64(x);
+              return __builtin_bswap64(value);
           }
 
-          static void barrier(void)
+          static u32 be32_to_cpu(u32 value)
           {
-              __asm__ volatile("dsb sy" ::: "memory");
+              return __builtin_bswap32(value);
+          }
+
+          static void memory_barrier(void)
+          {
+              __asm__ volatile(
+                  "dsb sy"
+                  :
+                  :
+                  : "memory"
+              );
           }
 
           /* ======================================================
              FW_CFG
              ====================================================== */
 
-          #define FW_CFG_FILE_DIR 0x0019
+          #define FW_CFG_SIGNATURE 0x0000
+          #define FW_CFG_ID        0x0001
+          #define FW_CFG_FILE_DIR  0x0019
 
           #define FW_CFG_DMA_ERROR  0x01
           #define FW_CFG_DMA_READ   0x02
@@ -274,32 +326,57 @@ jobs:
           #define FW_CFG_DMA_SELECT 0x08
           #define FW_CFG_DMA_WRITE  0x10
 
-          struct fw_dma {
+          /*
+           * Deliberately global.
+           *
+           * During bring-up we're avoiding having the important
+           * DMA structures live on Pebble's stack.
+           */
+
+          struct fw_cfg_dma_access {
               u32 control;
               u32 length;
               u64 address;
           } __attribute__((packed, aligned(8)));
 
-          static volatile struct fw_dma dma;
+          static volatile struct fw_cfg_dma_access
+              fw_dma_descriptor;
+
+          static u16 ramfb_selector = 0;
+          static u32 ramfb_size = 0;
+
+          static volatile u8 *const fw_data =
+              (volatile u8 *)(FWCFG_BASE + 0);
+
+          static volatile u16 *const fw_selector =
+              (volatile u16 *)(FWCFG_BASE + 8);
+
+          static volatile u64 *const fw_dma_address =
+              (volatile u64 *)(FWCFG_BASE + 16);
 
           static void fw_select(u16 selector)
           {
-              volatile u16 *reg =
-                  (volatile u16 *)(FWCFG_BASE + 8);
-
-              *reg = be16(selector);
-              barrier();
+              *fw_selector = cpu_to_be16(selector);
+              memory_barrier();
           }
 
           static u8 fw_read8(void)
           {
-              volatile u8 *data =
-                  (volatile u8 *)(FWCFG_BASE + 0);
-
-              return *data;
+              return *fw_data;
           }
 
-          static u32 read_be32_stream(void)
+          static u16 fw_read_be16(void)
+          {
+              u16 a = fw_read8();
+              u16 b = fw_read8();
+
+              return (u16)(
+                  (a << 8) |
+                  b
+              );
+          }
+
+          static u32 fw_read_be32(void)
           {
               u32 a = fw_read8();
               u32 b = fw_read8();
@@ -309,182 +386,448 @@ jobs:
               return
                   (a << 24) |
                   (b << 16) |
-                  (c << 8)  |
-                   d;
+                  (c << 8) |
+                  d;
           }
 
-          static u16 read_be16_stream(void)
+          static u32 fw_read_le32(void)
           {
-              u16 a = fw_read8();
-              u16 b = fw_read8();
+              u32 a = fw_read8();
+              u32 b = fw_read8();
+              u32 c = fw_read8();
+              u32 d = fw_read8();
 
-              return (u16)((a << 8) | b);
-          }
-
-          static int name_is_ramfb(const char *name)
-          {
-              const char target[] = "etc/ramfb";
-              u32 i;
-
-              for (i = 0; target[i]; i++) {
-                  if (name[i] != target[i])
-                      return 0;
-              }
-
-              return name[i] == 0;
-          }
-
-          static u16 find_ramfb(void)
-          {
-              u32 count;
-              u32 i;
-
-              fw_select(FW_CFG_FILE_DIR);
-
-              count = read_be32_stream();
-
-              print("fw_cfg: directory entries = ");
-              print_uint(count);
-              print("\n");
-
-              if (count > 512)
-                  return 0;
-
-              for (i = 0; i < count; i++) {
-                  u32 size;
-                  u16 selector;
-                  u32 j;
-                  char name[57];
-
-                  size = read_be32_stream();
-                  selector = read_be16_stream();
-
-                  /* reserved */
-                  fw_read8();
-                  fw_read8();
-
-                  for (j = 0; j < 56; j++)
-                      name[j] = (char)fw_read8();
-
-                  name[56] = 0;
-
-                  if (name_is_ramfb(name)) {
-                      print("fw_cfg: found etc/ramfb\n");
-                      print("fw_cfg: ramfb config bytes = ");
-                      print_uint(size);
-                      print("\n");
-
-                      return selector;
-                  }
-              }
-
-              return 0;
-          }
-
-          static int fw_dma_write(
-              u16 selector,
-              const void *buffer,
-              u32 length)
-          {
-              volatile u64 *dma_reg =
-                  (volatile u64 *)(FWCFG_BASE + 16);
-
-              u32 control =
-                  ((u32)selector << 16) |
-                  FW_CFG_DMA_SELECT |
-                  FW_CFG_DMA_WRITE;
-
-              dma.control = be32(control);
-              dma.length  = be32(length);
-              dma.address = be64((u64)buffer);
-
-              barrier();
-
-              /*
-               * fw_cfg's DMA address register is big-endian.
-               */
-              *dma_reg = be64((u64)&dma);
-
-              barrier();
-
-              /*
-               * Current QEMU completes this synchronously,
-               * but still wait according to the interface contract.
-               */
-              {
-                  u32 spins = 1000000;
-
-                  while (spins--) {
-                      u32 result;
-
-                      barrier();
-                      result = be32(dma.control);
-
-                      if (result == 0)
-                          return 1;
-
-                      if (result & FW_CFG_DMA_ERROR)
-                          return 0;
-                  }
-              }
-
-              return 0;
+              return
+                  a |
+                  (b << 8) |
+                  (c << 16) |
+                  (d << 24);
           }
 
           /* ======================================================
-             RAMFB
+             FW_CFG PROBE
              ====================================================== */
 
-          struct ramfb_cfg {
-              u64 addr;
+          static int fw_cfg_probe(void)
+          {
+              u32 features;
+
+              print(
+                  "Slate: checkpoint A - "
+                  "probing fw_cfg\n"
+              );
+
+              fw_select(FW_CFG_SIGNATURE);
+
+              if (fw_read8() != 'Q') {
+                  print("Slate: signature byte Q FAILED\n");
+                  return 0;
+              }
+
+              if (fw_read8() != 'E') {
+                  print("Slate: signature byte E FAILED\n");
+                  return 0;
+              }
+
+              if (fw_read8() != 'M') {
+                  print("Slate: signature byte M FAILED\n");
+                  return 0;
+              }
+
+              if (fw_read8() != 'U') {
+                  print("Slate: signature byte U FAILED\n");
+                  return 0;
+              }
+
+              print(
+                  "Slate: checkpoint B - "
+                  "signature QEMU\n"
+              );
+
+              fw_select(FW_CFG_ID);
+
+              features = fw_read_le32();
+
+              print(
+                  "Slate: checkpoint C - "
+                  "features = "
+              );
+
+              print_u32(features);
+              print("\n");
+
+              if ((features & 1U) == 0) {
+                  print(
+                      "Slate: traditional fw_cfg "
+                      "missing\n"
+                  );
+
+                  return 0;
+              }
+
+              if ((features & 2U) == 0) {
+                  print(
+                      "Slate: fw_cfg DMA "
+                      "NOT AVAILABLE\n"
+                  );
+
+                  return 0;
+              }
+
+              print(
+                  "Slate: checkpoint D - "
+                  "DMA supported\n"
+              );
+
+              return 1;
+          }
+
+          /* ======================================================
+             FIND RAMFB
+             ====================================================== */
+
+          static int find_ramfb(void)
+          {
+              u32 count;
+              u32 entry;
+
+              print(
+                  "Slate: checkpoint E - "
+                  "opening fw_cfg directory\n"
+              );
+
+              fw_select(FW_CFG_FILE_DIR);
+
+              count = fw_read_be32();
+
+              print("fw_cfg: directory entries = ");
+              print_u32(count);
+              print("\n");
+
+              if (count == 0 || count > 512) {
+                  print(
+                      "Slate: insane directory count\n"
+                  );
+
+                  return 0;
+              }
+
+              for (entry = 0; entry < count; entry++) {
+                  u32 size;
+                  u16 selector;
+                  u32 i;
+
+                  /*
+                   * Instead of allocating name[57] on the stack,
+                   * compare etc/ramfb directly while streaming
+                   * through the directory.
+                   */
+
+                  static const char target[] =
+                      "etc/ramfb";
+
+                  int match = 1;
+
+                  size = fw_read_be32();
+                  selector = fw_read_be16();
+
+                  /*
+                   * reserved uint16
+                   */
+                  (void)fw_read8();
+                  (void)fw_read8();
+
+                  for (i = 0; i < 56; i++) {
+                      u8 c = fw_read8();
+
+                      if (i < 9) {
+                          if (c != (u8)target[i])
+                              match = 0;
+                      } else if (i == 9) {
+                          if (c != 0)
+                              match = 0;
+                      }
+                  }
+
+                  if (match) {
+                      ramfb_selector = selector;
+                      ramfb_size = size;
+
+                      print(
+                          "Slate: checkpoint F - "
+                          "FOUND etc/ramfb\n"
+                      );
+
+                      print(
+                          "fw_cfg: selector = "
+                      );
+
+                      print_hex16(ramfb_selector);
+                      print("\n");
+
+                      print(
+                          "fw_cfg: ramfb bytes = "
+                      );
+
+                      print_u32(ramfb_size);
+                      print("\n");
+
+                      /*
+                       * IMPORTANT:
+                       *
+                       * Do not return immediately after the UART
+                       * calls like the previous build did.
+                       *
+                       * Make the state global, leave the loop,
+                       * then return through one boring path.
+                       */
+                      break;
+                  }
+              }
+
+              print(
+                  "Slate: checkpoint G - "
+                  "directory scan returned\n"
+              );
+
+              if (ramfb_selector == 0) {
+                  print(
+                      "Slate: etc/ramfb missing\n"
+                  );
+
+                  return 0;
+              }
+
+              if (ramfb_size != 28) {
+                  print(
+                      "Slate: unexpected RAMFB "
+                      "config size\n"
+                  );
+
+                  return 0;
+              }
+
+              print(
+                  "Slate: checkpoint H - "
+                  "RAMFB entry validated\n"
+              );
+
+              return 1;
+          }
+
+          /* ======================================================
+             RAMFB CONFIG
+             ====================================================== */
+
+          struct ramfb_config {
+              u64 address;
               u32 fourcc;
               u32 flags;
               u32 width;
               u32 height;
               u32 stride;
-          } __attribute__((packed));
+          } __attribute__((packed, aligned(8)));
+
+          static struct ramfb_config
+              ramfb_configuration;
 
           /*
            * DRM_FORMAT_XRGB8888
-           * fourcc('X','R','2','4')
+           *
+           * fourcc('X', 'R', '2', '4')
            */
+
           #define FOURCC_XR24 \
-              ((u32)'X' | ((u32)'R' << 8) | \
-              ((u32)'2' << 16) | ((u32)'4' << 24))
+              ((u32)'X' | \
+              ((u32)'R' << 8) | \
+              ((u32)'2' << 16) | \
+              ((u32)'4' << 24))
+
+          static void prepare_ramfb_config(void)
+          {
+              print(
+                  "Slate: checkpoint I - "
+                  "preparing RAMFB config\n"
+              );
+
+              ramfb_configuration.address =
+                  cpu_to_be64(FB_ADDR);
+
+              ramfb_configuration.fourcc =
+                  cpu_to_be32(FOURCC_XR24);
+
+              ramfb_configuration.flags =
+                  cpu_to_be32(0);
+
+              ramfb_configuration.width =
+                  cpu_to_be32(FB_WIDTH);
+
+              ramfb_configuration.height =
+                  cpu_to_be32(FB_HEIGHT);
+
+              ramfb_configuration.stride =
+                  cpu_to_be32(FB_STRIDE);
+
+              memory_barrier();
+
+              print(
+                  "Slate: checkpoint J - "
+                  "RAMFB config prepared\n"
+              );
+          }
+
+          /* ======================================================
+             FW_CFG DMA WRITE
+             ====================================================== */
+
+          static int fw_cfg_dma_write(
+              u16 selector,
+              const void *source,
+              u32 length)
+          {
+              u32 control;
+              u32 spins;
+
+              print(
+                  "Slate: checkpoint K - "
+                  "building DMA descriptor\n"
+              );
+
+              control =
+                  ((u32)selector << 16) |
+                  FW_CFG_DMA_SELECT |
+                  FW_CFG_DMA_WRITE;
+
+              fw_dma_descriptor.control =
+                  cpu_to_be32(control);
+
+              fw_dma_descriptor.length =
+                  cpu_to_be32(length);
+
+              fw_dma_descriptor.address =
+                  cpu_to_be64((u64)source);
+
+              memory_barrier();
+
+              print(
+                  "Slate: checkpoint L - "
+                  "DMA descriptor ready\n"
+              );
+
+              print(
+                  "Slate: checkpoint M - "
+                  "writing DMA register NOW\n"
+              );
+
+              /*
+               * The fw_cfg specification says the MMIO DMA
+               * address register itself is big-endian.
+               */
+
+              *fw_dma_address =
+                  cpu_to_be64(
+                      (u64)&fw_dma_descriptor
+                  );
+
+              memory_barrier();
+
+              print(
+                  "Slate: checkpoint N - "
+                  "DMA register write survived\n"
+              );
+
+              /*
+               * QEMU normally completes this immediately.
+               * Still poll the descriptor according to the
+               * interface contract.
+               */
+
+              for (spins = 0;
+                   spins < 1000000U;
+                   spins++) {
+
+                  u32 result;
+
+                  memory_barrier();
+
+                  result =
+                      be32_to_cpu(
+                          fw_dma_descriptor.control
+                      );
+
+                  if (result == 0) {
+                      print(
+                          "Slate: checkpoint O - "
+                          "DMA COMPLETE\n"
+                      );
+
+                      return 1;
+                  }
+
+                  if (result & FW_CFG_DMA_ERROR) {
+                      print(
+                          "Slate: DMA ERROR bit set\n"
+                      );
+
+                      return 0;
+                  }
+              }
+
+              print(
+                  "Slate: DMA TIMEOUT\n"
+              );
+
+              return 0;
+          }
+
+          /* ======================================================
+             RAMFB INIT
+             ====================================================== */
 
           static int ramfb_init(void)
           {
-              u16 selector;
-              struct ramfb_cfg cfg;
+              print(
+                  "\n"
+                  "====================================\n"
+                  "       SLATE DISPLAY BRING-UP\n"
+                  "====================================\n"
+              );
 
-              print("Slate: locating ramfb...\n");
+              if (!fw_cfg_probe())
+                  return 0;
 
-              selector = find_ramfb();
+              if (!find_ramfb())
+                  return 0;
 
-              if (!selector) {
-                  print("Slate: etc/ramfb NOT FOUND 💀\n");
+              print(
+                  "Slate: checkpoint H2 - "
+                  "find_ramfb REALLY returned\n"
+              );
+
+              prepare_ramfb_config();
+
+              print(
+                  "Slate: checkpoint J2 - "
+                  "calling DMA writer\n"
+              );
+
+              if (!fw_cfg_dma_write(
+                      ramfb_selector,
+                      &ramfb_configuration,
+                      sizeof(ramfb_configuration))) {
+
+                  print(
+                      "Slate: RAMFB DMA failed\n"
+                  );
+
                   return 0;
               }
 
-              cfg.addr   = be64(FB_ADDR);
-              cfg.fourcc = be32(FOURCC_XR24);
-              cfg.flags  = be32(0);
-              cfg.width  = be32(FB_WIDTH);
-              cfg.height = be32(FB_HEIGHT);
-              cfg.stride = be32(FB_STRIDE);
+              print(
+                  "Slate: checkpoint P - "
+                  "RAMFB ONLINE\n"
+              );
 
-              print("Slate: configuring 640x480 XR24...\n");
-
-              if (!fw_dma_write(
-                      selector,
-                      &cfg,
-                      sizeof(cfg))) {
-
-                  print("Slate: ramfb DMA write FAILED 💀\n");
-                  return 0;
-              }
-
-              print("Slate: RAMFB ONLINE 🔥\n");
               return 1;
           }
 
@@ -492,17 +835,15 @@ jobs:
              PIXELS
              ====================================================== */
 
-          static u32 rgb(u8 r, u8 g, u8 b)
+          static u32 rgb(
+              u8 red,
+              u8 green,
+              u8 blue)
           {
-              /*
-               * XR24 on little endian:
-               *
-               * memory = B G R X
-               */
               return
-                  ((u32)r << 16) |
-                  ((u32)g << 8) |
-                  ((u32)b);
+                  ((u32)red << 16) |
+                  ((u32)green << 8) |
+                  (u32)blue;
           }
 
           static void pixel(
@@ -512,26 +853,36 @@ jobs:
           {
               if (x < 0 ||
                   y < 0 ||
-                  x >= FB_WIDTH ||
-                  y >= FB_HEIGHT)
-                  return;
+                  x >= (int)FB_WIDTH ||
+                  y >= (int)FB_HEIGHT) {
 
-              fb[y * FB_WIDTH + x] = color;
+                  return;
+              }
+
+              framebuffer[
+                  ((u32)y * FB_WIDTH) +
+                  (u32)x
+              ] = color;
           }
 
-          static void rect(
+          static void rectangle(
               int x,
               int y,
-              int w,
-              int h,
+              int width,
+              int height,
               u32 color)
           {
               int yy;
               int xx;
 
-              for (yy = y; yy < y + h; yy++) {
-                  for (xx = x; xx < x + w; xx++)
-                      pixel(xx, yy, color);
+              for (yy = 0; yy < height; yy++) {
+                  for (xx = 0; xx < width; xx++) {
+                      pixel(
+                          x + xx,
+                          y + yy,
+                          color
+                      );
+                  }
               }
           }
 
@@ -541,135 +892,115 @@ jobs:
 
               for (i = 0;
                    i < FB_WIDTH * FB_HEIGHT;
-                   i++)
-                  fb[i] = color;
+                   i++) {
+
+                  framebuffer[i] = color;
+              }
+
+              memory_barrier();
           }
 
           static void circle(
-              int cx,
-              int cy,
+              int center_x,
+              int center_y,
               int radius,
               u32 color)
           {
               int x;
               int y;
 
-              for (y = -radius; y <= radius; y++) {
-                  for (x = -radius; x <= radius; x++) {
-                      if ((x*x + y*y) <= radius*radius)
-                          pixel(cx+x, cy+y, color);
+              for (y = -radius;
+                   y <= radius;
+                   y++) {
+
+                  for (x = -radius;
+                       x <= radius;
+                       x++) {
+
+                      if (
+                          (x * x) +
+                          (y * y)
+                          <=
+                          radius * radius) {
+
+                          pixel(
+                              center_x + x,
+                              center_y + y,
+                              color
+                          );
+                      }
                   }
               }
           }
 
           /* ======================================================
-             TINY FONT
+             MINIMAL FONT
              ====================================================== */
 
           static const u8 font[][7] = {
-              /* A */
-              {14,17,17,31,17,17,17},
-
-              /* B */
-              {30,17,17,30,17,17,30},
-
-              /* C */
-              {14,17,16,16,16,17,14},
-
-              /* D */
-              {30,17,17,17,17,17,30},
-
-              /* E */
-              {31,16,16,30,16,16,31},
-
-              /* F */
-              {31,16,16,30,16,16,16},
-
-              /* G */
-              {14,17,16,23,17,17,15},
-
-              /* H */
-              {17,17,17,31,17,17,17},
-
-              /* I */
-              {31,4,4,4,4,4,31},
-
-              /* J */
-              {7,2,2,2,18,18,12},
-
-              /* K */
-              {17,18,20,24,20,18,17},
-
-              /* L */
-              {16,16,16,16,16,16,31},
-
-              /* M */
-              {17,27,21,21,17,17,17},
-
-              /* N */
-              {17,25,21,19,17,17,17},
-
-              /* O */
-              {14,17,17,17,17,17,14},
-
-              /* P */
-              {30,17,17,30,16,16,16},
-
-              /* Q */
-              {14,17,17,17,21,18,13},
-
-              /* R */
-              {30,17,17,30,20,18,17},
-
-              /* S */
-              {15,16,16,14,1,1,30},
-
-              /* T */
-              {31,4,4,4,4,4,4},
-
-              /* U */
-              {17,17,17,17,17,17,14},
-
-              /* V */
-              {17,17,17,17,17,10,4},
-
-              /* W */
-              {17,17,17,21,21,21,10},
-
-              /* X */
-              {17,17,10,4,10,17,17},
-
-              /* Y */
-              {17,17,10,4,4,4,4},
-
-              /* Z */
-              {31,1,2,4,8,16,31}
+              {14,17,17,31,17,17,17}, /* A */
+              {30,17,17,30,17,17,30}, /* B */
+              {14,17,16,16,16,17,14}, /* C */
+              {30,17,17,17,17,17,30}, /* D */
+              {31,16,16,30,16,16,31}, /* E */
+              {31,16,16,30,16,16,16}, /* F */
+              {14,17,16,23,17,17,15}, /* G */
+              {17,17,17,31,17,17,17}, /* H */
+              {31,4,4,4,4,4,31},      /* I */
+              {7,2,2,2,18,18,12},     /* J */
+              {17,18,20,24,20,18,17}, /* K */
+              {16,16,16,16,16,16,31}, /* L */
+              {17,27,21,21,17,17,17}, /* M */
+              {17,25,21,19,17,17,17}, /* N */
+              {14,17,17,17,17,17,14}, /* O */
+              {30,17,17,30,16,16,16}, /* P */
+              {14,17,17,17,21,18,13}, /* Q */
+              {30,17,17,30,20,18,17}, /* R */
+              {15,16,16,14,1,1,30},   /* S */
+              {31,4,4,4,4,4,4},       /* T */
+              {17,17,17,17,17,17,14}, /* U */
+              {17,17,17,17,17,10,4},  /* V */
+              {17,17,17,21,21,21,10}, /* W */
+              {17,17,10,4,10,17,17},  /* X */
+              {17,17,10,4,4,4,4},     /* Y */
+              {31,1,2,4,8,16,31}      /* Z */
           };
 
-          static void letter(
+          static void draw_letter(
               int x,
               int y,
-              char c,
+              char character,
               int scale,
               u32 color)
           {
               int row;
-              int col;
+              int column;
               const u8 *glyph;
 
-              if (c < 'A' || c > 'Z')
+              if (character < 'A' ||
+                  character > 'Z') {
+
                   return;
+              }
 
-              glyph = font[c - 'A'];
+              glyph =
+                  font[character - 'A'];
 
-              for (row = 0; row < 7; row++) {
-                  for (col = 0; col < 5; col++) {
-                      if (glyph[row] &
-                          (1 << (4-col))) {
+              for (row = 0;
+                   row < 7;
+                   row++) {
 
-                          rect(
-                              x + col*scale,
-                              y + row*scale,
+                  for (column = 0;
+                       column < 5;
+                       column++) {
+
+                      if (
+                          glyph[row] &
+                          (1U << (4 - column))) {
+
+                          rectangle(
+                              x + column * scale,
+                              y + row * scale,
                               scale,
                               scale,
                               color
@@ -679,47 +1010,114 @@ jobs:
               }
           }
 
-          static int text_width(
-              const char *s,
+          static int string_width(
+              const char *text,
               int scale)
           {
-              int n = 0;
+              int count = 0;
 
-              while (*s++) n++;
+              while (*text++) {
+                  count++;
+              }
 
-              return n * 6 * scale;
+              return count * 6 * scale;
           }
 
-          static void text(
+          static void draw_text(
               int x,
               int y,
-              const char *s,
+              const char *text,
               int scale,
               u32 color)
           {
-              while (*s) {
-                  if (*s != ' ')
-                      letter(x, y, *s, scale, color);
+              while (*text) {
+                  if (*text != ' ') {
+                      draw_letter(
+                          x,
+                          y,
+                          *text,
+                          scale,
+                          color
+                      );
+                  }
 
                   x += 6 * scale;
-                  s++;
+                  text++;
               }
           }
 
-          static void centered(
+          static void centered_text(
               int y,
-              const char *s,
+              const char *text,
               int scale,
               u32 color)
           {
-              int w = text_width(s, scale);
+              int width =
+                  string_width(
+                      text,
+                      scale
+                  );
 
-              text(
-                  (FB_WIDTH - w) / 2,
+              draw_text(
+                  ((int)FB_WIDTH - width) / 2,
                   y,
-                  s,
+                  text,
                   scale,
                   color
+              );
+          }
+
+          /* ======================================================
+             CHIP
+             ====================================================== */
+
+          static void draw_chip(
+              int center_x,
+              int center_y,
+              int size)
+          {
+              u32 stone =
+                  rgb(122, 136, 150);
+
+              u32 dark =
+                  rgb(25, 31, 38);
+
+              rectangle(
+                  center_x - size,
+                  center_y - size / 2,
+                  size * 2,
+                  size,
+                  stone
+              );
+
+              rectangle(
+                  center_x - size + 6,
+                  center_y - size / 2 - 6,
+                  size * 2 - 12,
+                  6,
+                  stone
+              );
+
+              circle(
+                  center_x - size / 3,
+                  center_y - 5,
+                  4,
+                  dark
+              );
+
+              circle(
+                  center_x + size / 3,
+                  center_y - 5,
+                  4,
+                  dark
+              );
+
+              rectangle(
+                  center_x - 14,
+                  center_y + 16,
+                  28,
+                  4,
+                  dark
               );
           }
 
@@ -727,163 +1125,141 @@ jobs:
              SLATE LOADER
              ====================================================== */
 
-          static void draw_rock(
-              int cx,
-              int cy,
-              int size,
-              u32 color)
+          static void slate_loader(
+              u32 progress)
           {
-              rect(
-                  cx - size,
-                  cy - size/2,
-                  size*2,
-                  size,
-                  color
+              u32 bar_width;
+
+              fill(
+                  rgb(12, 18, 27)
               );
 
-              rect(
-                  cx - size + 5,
-                  cy - size/2 - 5,
-                  size*2 - 10,
-                  5,
-                  color
-              );
-
-              rect(
-                  cx - size + 8,
-                  cy + size/2,
-                  size*2 - 16,
-                  4,
-                  color
-              );
-          }
-
-          static void slate_loader(u32 progress)
-          {
-              int bar_width;
-
-              fill(rgb(12, 18, 27));
-
-              centered(
+              centered_text(
                   55,
                   "PEBBLE",
                   5,
                   rgb(245,245,245)
               );
 
-              draw_rock(
+              draw_chip(
                   320,
                   190,
-                  45,
-                  rgb(120,135,150)
+                  46
               );
 
-              circle(
-                  302,
-                  183,
-                  4,
-                  rgb(20,25,30)
-              );
-
-              circle(
-                  338,
-                  183,
-                  4,
-                  rgb(20,25,30)
-              );
-
-              rect(
-                  304,
-                  215,
-                  32,
-                  5,
-                  rgb(80,95,110)
-              );
-
-              rect(
+              rectangle(
                   120,
                   300,
                   400,
                   24,
-                  rgb(40,50,62)
+                  rgb(42,52,64)
               );
 
               bar_width =
-                  (int)((progress * 392) / 100);
+                  (progress * 392U) /
+                  100U;
 
-              rect(
+              rectangle(
                   124,
                   304,
-                  bar_width,
+                  (int)bar_width,
                   16,
-                  rgb(210,220,230)
+                  rgb(220,228,235)
               );
 
-              centered(
+              centered_text(
                   350,
                   "STARTING SLATE",
                   2,
-                  rgb(210,220,230)
+                  rgb(220,228,235)
               );
 
-              barrier();
+              memory_barrier();
           }
 
           static void delay(void)
           {
               volatile u32 i;
 
-              for (i = 0; i < 5000000; i++)
+              for (i = 0;
+                   i < 2500000U;
+                   i++) {
+
                   __asm__ volatile("nop");
+              }
           }
 
           /* ======================================================
-             BEACH
+             WALLPAPER
              ====================================================== */
 
           static void draw_wallpaper(void)
           {
               u32 x;
               u32 y;
-              usize p = 0;
+              usize source = 0;
 
-              print("Slate: drawing Pebble Shore...\n");
+              print(
+                  "Slate: drawing Pebble Shore\n"
+              );
 
-              for (y = 0; y < FB_HEIGHT; y++) {
-                  for (x = 0; x < FB_WIDTH; x++) {
-                      u8 r = shore_rgb[p++];
-                      u8 g = shore_rgb[p++];
-                      u8 b = shore_rgb[p++];
+              for (y = 0;
+                   y < FB_HEIGHT;
+                   y++) {
 
-                      fb[y * FB_WIDTH + x] =
-                          rgb(r,g,b);
+                  for (x = 0;
+                       x < FB_WIDTH;
+                       x++) {
+
+                      u8 red =
+                          shore_rgb[source++];
+
+                      u8 green =
+                          shore_rgb[source++];
+
+                      u8 blue =
+                          shore_rgb[source++];
+
+                      framebuffer[
+                          y * FB_WIDTH + x
+                      ] = rgb(
+                          red,
+                          green,
+                          blue
+                      );
                   }
               }
 
-              barrier();
+              memory_barrier();
+
+              print(
+                  "Slate: Pebble Shore pixels copied\n"
+              );
           }
 
           /* ======================================================
              LOCK SCREEN
              ====================================================== */
 
-          static void lock_screen(void)
+          static void draw_lock_screen(void)
           {
               /*
-               * Card shadow.
+               * Shadow
                */
-              rect(
+
+              rectangle(
                   183,
                   113,
                   286,
                   266,
-                  rgb(15,22,30)
+                  rgb(20,25,32)
               );
 
               /*
-               * Main card.
+               * Main card
                */
-              rect(
+
+              rectangle(
                   175,
                   105,
                   286,
@@ -891,54 +1267,59 @@ jobs:
                   rgb(238,242,245)
               );
 
-              centered(
+              centered_text(
                   135,
                   "PEBBLE",
                   3,
                   rgb(30,38,48)
               );
 
-              draw_rock(
+              draw_chip(
                   320,
                   220,
-                  34,
-                  rgb(100,115,130)
+                  34
               );
 
               circle(
-                  307,
-                  214,
-                  3,
-                  rgb(20,25,30)
+                  275,
+                  290,
+                  7,
+                  rgb(55,65,75)
               );
 
               circle(
-                  333,
-                  214,
-                  3,
-                  rgb(20,25,30)
+                  305,
+                  290,
+                  7,
+                  rgb(55,65,75)
               );
 
-              /*
-               * PIN dots.
-               */
-              circle(275,290,7,rgb(55,65,75));
-              circle(305,290,7,rgb(55,65,75));
-              circle(335,290,7,rgb(55,65,75));
-              circle(365,290,7,rgb(55,65,75));
+              circle(
+                  335,
+                  290,
+                  7,
+                  rgb(55,65,75)
+              );
 
-              centered(
+              circle(
+                  365,
+                  290,
+                  7,
+                  rgb(55,65,75)
+              );
+
+              centered_text(
                   325,
                   "WELCOME",
                   2,
                   rgb(50,60,70)
               );
 
-              barrier();
+              memory_barrier();
           }
 
           /* ======================================================
-             BOOT
+             PEBBLE
              ====================================================== */
 
           void pebble_main(void)
@@ -946,27 +1327,67 @@ jobs:
               print(
                   "\n"
                   "====================================\n"
-                  " PEBBLE 0.5.1 - SLATE GRAPHICS\n"
+                  " PEBBLE 0.5.2 - SLATE DISPLAY\n"
                   "====================================\n"
+                  "\n"
               );
 
-              print("[ OK ] Pebble kernel\n");
-              print("[ .. ] Looking for graphical display\n");
+              print(
+                  "[ OK ] Pebble kernel entered\n"
+              );
+
+              print(
+                  "[ .. ] Bringing up graphics\n"
+              );
 
               if (!ramfb_init()) {
                   print(
                       "\n"
-                      "💀 GRAPHICS FAILED\n"
-                      "Stone serial lifeline still alive.\n"
+                      "====================================\n"
+                      " SLATE DISPLAY FAILED\n"
+                      " Stone serial lifeline survived.\n"
+                      "====================================\n"
                   );
 
-                  for (;;)
+                  for (;;) {
                       __asm__ volatile("wfe");
+                  }
               }
 
-              print("[ OK ] fw_cfg\n");
-              print("[ OK ] ramfb\n");
-              print("[ OK ] 640x480 framebuffer\n");
+              print(
+                  "[ OK ] fw_cfg\n"
+              );
+
+              print(
+                  "[ OK ] ramfb\n"
+              );
+
+              print(
+                  "[ OK ] 640x480 XR24 framebuffer\n"
+              );
+
+              print(
+                  "Slate: TEST PIXELS NOW\n"
+              );
+
+              /*
+               * Immediate visual sanity check.
+               *
+               * If the screenshot becomes blue-ish,
+               * framebuffer output itself works.
+               */
+
+              fill(
+                  rgb(25, 75, 120)
+              );
+
+              memory_barrier();
+
+              print(
+                  "Slate: framebuffer memory written\n"
+              );
+
+              delay();
 
               slate_loader(10);
               print("[SLATE 10%] Kernel\n");
@@ -998,12 +1419,19 @@ jobs:
 
               draw_wallpaper();
 
-              print("[ OK ] Pebble Shore rendered\n");
+              print(
+                  "[ OK ] Pebble Shore rendered\n"
+              );
 
-              lock_screen();
+              draw_lock_screen();
 
-              print("[ OK ] Slate lock screen rendered\n");
-              print("Chip: BEACH EPISODE 🔥\n");
+              print(
+                  "[ OK ] Slate lock screen rendered\n"
+              );
+
+              print(
+                  "Chip: BEACH EPISODE\n"
+              );
 
               print(
                   "\n"
@@ -1012,10 +1440,13 @@ jobs:
                   "====================================\n"
               );
 
-              for (;;)
+              for (;;) {
                   __asm__ volatile("wfe");
+              }
           }
           EOF
+
+          echo "🪨 Pebble source generated"
 
       # ============================================================
       # BUILD
@@ -1025,7 +1456,11 @@ jobs:
         run: |
           set -e
 
-          COMMON="-ffreestanding -fno-stack-protector -fno-pie -nostdlib"
+          COMMON="\
+          -ffreestanding \
+          -fno-stack-protector \
+          -fno-pie \
+          -nostdlib"
 
           aarch64-linux-gnu-gcc \
             $COMMON \
@@ -1047,11 +1482,13 @@ jobs:
             build/kernel.o \
             -o build/pebble.elf
 
+          echo ""
           echo "🪨 Kernel:"
+          file build/pebble.elf
           ls -lh build/pebble.elf
 
       # ============================================================
-      # GRAPHICAL BOOT
+      # BOOT
       # ============================================================
 
       - name: "🖥️ Boot graphical Pebble"
@@ -1060,9 +1497,13 @@ jobs:
 
           rm -f build/qemu-monitor.sock
           rm -f build/boot.log
+          rm -f build/qemu.log
           rm -f release/slate-screen.ppm
 
+          echo "🚀 Launching Pebble..."
+
           qemu-system-aarch64 \
+            -L /usr/share/seabios \
             -M virt \
             -cpu cortex-a53 \
             -m 128M \
@@ -1071,139 +1512,214 @@ jobs:
             -display none \
             -serial file:build/boot.log \
             -monitor unix:build/qemu-monitor.sock,server=on,wait=off \
+            2>build/qemu.log \
             &
 
           QEMU_PID=$!
 
           echo "QEMU PID: $QEMU_PID"
 
-          # Wait for Pebble to reach the lock screen.
-          for i in $(seq 1 30); do
+          FINISHED=0
+
+          for i in $(seq 1 40); do
             if grep -q \
               "Slate lock screen rendered" \
               build/boot.log 2>/dev/null; then
-              echo "🔥 Slate reached lock screen!"
+
+              FINISHED=1
+              echo "🔥 Slate reached lock screen"
               break
             fi
 
-            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-              echo "💀 QEMU died."
-              cat build/boot.log || true
-              exit 1
+            if ! kill -0 \
+              "$QEMU_PID" \
+              2>/dev/null; then
+
+              echo "💀 QEMU exited unexpectedly"
+              break
             fi
 
             sleep 1
           done
 
           echo ""
-          echo "========= PEBBLE SERIAL ========="
-          cat build/boot.log
-          echo "================================="
+          echo "========== PEBBLE SERIAL =========="
+          cat build/boot.log || true
+          echo "==================================="
 
-          grep -q \
-            "Slate: RAMFB ONLINE" \
-            build/boot.log
+          echo ""
+          echo "============ QEMU LOG ============="
+          cat build/qemu.log || true
+          echo "==================================="
 
-          grep -q \
-            "SLATE 100%" \
-            build/boot.log
+          echo ""
+          echo "📸 Attempting framebuffer screenshot..."
 
-          grep -q \
-            "Pebble Shore rendered" \
-            build/boot.log
-
-          grep -q \
-            "Slate lock screen rendered" \
-            build/boot.log
-
-          # Ask QEMU's monitor to dump the graphical console.
-          echo \
-            "screendump release/slate-screen.ppm" \
-            | socat - UNIX-CONNECT:build/qemu-monitor.sock
+          if [ -S build/qemu-monitor.sock ]; then
+            printf \
+              'screendump release/slate-screen.ppm\n' \
+              | socat - \
+                UNIX-CONNECT:build/qemu-monitor.sock \
+              || true
+          fi
 
           sleep 2
 
-          kill "$QEMU_PID" || true
-          wait "$QEMU_PID" || true
+          kill "$QEMU_PID" \
+            2>/dev/null \
+            || true
+
+          wait "$QEMU_PID" \
+            2>/dev/null \
+            || true
+
+          echo ""
+          echo "========= GRAPHICS CHECK ========="
+
+          if grep -q \
+            "checkpoint O - DMA COMPLETE" \
+            build/boot.log; then
+
+            echo "🔥 fw_cfg DMA COMPLETE"
+          else
+            echo "💀 DMA never completed"
+          fi
+
+          if grep -q \
+            "checkpoint P - RAMFB ONLINE" \
+            build/boot.log; then
+
+            echo "🔥 RAMFB ONLINE"
+          else
+            echo "💀 RAMFB never came online"
+          fi
+
+          if grep -q \
+            "Slate lock screen rendered" \
+            build/boot.log; then
+
+            echo "🔥 Slate lock screen rendered"
+          else
+            echo "💀 Slate did not reach lock screen"
+          fi
+
+          if [ -s release/slate-screen.ppm ]; then
+            echo "🔥 Screenshot captured"
+            ls -lh release/slate-screen.ppm
+          else
+            echo "💀 Screenshot missing"
+          fi
+
+          echo "=================================="
+
+          #
+          # IMPORTANT:
+          #
+          # Preserve logs even if graphics fails.
+          # Then fail at the END so we don't lose
+          # the actual murder evidence.
+          #
+
+          cp build/boot.log \
+            release/boot.log || true
+
+          cp build/qemu.log \
+            release/qemu.log || true
+
+          if [ "$FINISHED" -ne 1 ]; then
+            echo ""
+            echo "💀 Slate did not finish."
+            echo "Read the LAST checkpoint above."
+            exit 1
+          fi
 
           test -s release/slate-screen.ppm
 
-          echo ""
-          echo "🔥🔥🔥 SCREENSHOT EXISTS 🔥🔥🔥"
-          ls -lh release/slate-screen.ppm
-
       # ============================================================
-      # CONVERT SCREENSHOT
+      # SCREENSHOT
       # ============================================================
 
       - name: "📸 Convert screenshot"
+        if: always()
         run: |
           set -e
 
-          convert \
-            release/slate-screen.ppm \
-            release/slate-screen.png
+          if [ -s release/slate-screen.ppm ]; then
+            convert \
+              release/slate-screen.ppm \
+              release/slate-screen.png
 
-          identify release/slate-screen.png
-
-          echo "🪨 Pebble is officially visible."
+            echo "🔥 SCREENSHOT:"
+            identify release/slate-screen.png
+          else
+            echo "⚠️ No screenshot to convert."
+          fi
 
       # ============================================================
-      # RELEASE
+      # PACKAGE
       # ============================================================
 
-      - name: "📦 Package"
+      - name: "📦 Package evidence"
+        if: always()
         run: |
           set -e
 
           cp build/pebble.elf \
-            release/pebble-0.5.1-slate-aarch64.elf
-
-          cp build/boot.log \
-            release/boot.log
+            release/pebble-0.5.2-slate-aarch64.elf \
+            2>/dev/null || true
 
           cp build/wallpaper/shore.png \
-            release/pebble-shore-source.png
+            release/pebble-shore-source.png \
+            2>/dev/null || true
+
+          cp build/boot.log \
+            release/boot.log \
+            2>/dev/null || true
+
+          cp build/qemu.log \
+            release/qemu.log \
+            2>/dev/null || true
 
           cat > release/README.txt <<'EOF'
-          Pebble 0.5.1 - Slate Graphics
-          =================================
+          Pebble 0.5.2 - Slate Display Bring-Up
+          ======================================
 
-          First Pebble graphical-display milestone.
+          Mission:
+          Make the rock produce actual pixels.
 
-          Hardware:
-          - AArch64
-          - QEMU virt
-          - fw_cfg MMIO
-          - fw_cfg DMA
-          - QEMU ramfb
-          - 640x480
-          - XRGB8888
-
-          Slate:
-          - graphical boot loader
-          - rock mascot
-          - progress bar
+          This build includes:
+          - AArch64 Pebble kernel
+          - fw_cfg signature detection
+          - fw_cfg feature detection
+          - fw_cfg DMA detection
+          - etc/ramfb discovery
+          - verbose checkpoint logging
+          - RAMFB DMA configuration
+          - 640x480 XRGB8888 framebuffer
+          - Slate graphical loader
           - Pebble Shore wallpaper
           - graphical lock screen
-          - Chip remains alive
+          - QEMU framebuffer screenshot
+          - serial and QEMU diagnostic logs
 
-          slate-screen.png is the actual framebuffer
-          screenshot captured from the running Pebble VM.
+          If graphics failed:
+          inspect boot.log and find the last
+          "Slate: checkpoint" message.
 
           No Linux.
           No distro underneath.
           Just Pebble.
 
-          The rock has a screen.
+          The rock demands pixels.
           EOF
 
           echo ""
-          echo "========= RELEASE ========="
+          echo "📦 Evidence:"
           ls -lh release/
 
-      - name: "⬆️ Upload Pebble"
+      - name: "⬆️ Upload Pebble evidence"
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: pebble-0.5.1-slate-graphics
+          name: pebble-0.5.2-slate-display
           path: release/
