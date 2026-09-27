@@ -1,0 +1,1096 @@
+typedef unsigned char      u8;
+typedef unsigned short     u16;
+typedef unsigned int       u32;
+typedef unsigned long      u64;
+typedef unsigned long      usize;
+
+#include "pebble_shore.h"
+
+/* ======================================================
+   HARDWARE
+   ====================================================== */
+
+#define UART_BASE   0x09000000UL
+#define FWCFG_BASE  0x09020000UL
+
+#define UART_DR (*(volatile u32 *)(UART_BASE + 0x00))
+#define UART_FR (*(volatile u32 *)(UART_BASE + 0x18))
+
+#define FB_ADDR   0x44000000UL
+#define FB_WIDTH  640U
+#define FB_HEIGHT 480U
+#define FB_STRIDE (FB_WIDTH * 4U)
+
+static volatile u32 *const fb =
+    (volatile u32 *)FB_ADDR;
+
+/* ======================================================
+   SERIAL
+   ====================================================== */
+
+static void putc(char c)
+{
+    while (UART_FR & (1U << 5)) {}
+
+    if (c == '\n') {
+        UART_DR = '\r';
+        while (UART_FR & (1U << 5)) {}
+    }
+
+    UART_DR = (u32)c;
+}
+
+static void print(const char *s)
+{
+    while (*s)
+        putc(*s++);
+}
+
+static void print_u32(u32 n)
+{
+    char b[16];
+    u32 i = 0;
+
+    if (!n) {
+        putc('0');
+        return;
+    }
+
+    while (n) {
+        b[i++] = (char)('0' + (n % 10));
+        n /= 10;
+    }
+
+    while (i)
+        putc(b[--i]);
+}
+
+static void print_hex16(u16 n)
+{
+    const char *hex = "0123456789ABCDEF";
+    int shift;
+
+    print("0x");
+
+    for (shift = 12; shift >= 0; shift -= 4)
+        putc(hex[(n >> shift) & 15]);
+}
+
+/* ======================================================
+   CPU / ENDIAN
+   ====================================================== */
+
+static u16 be16(u16 n)
+{
+    return (u16)((n >> 8) | (n << 8));
+}
+
+static u32 be32(u32 n)
+{
+    return __builtin_bswap32(n);
+}
+
+static u64 be64(u64 n)
+{
+    return __builtin_bswap64(n);
+}
+
+static void barrier(void)
+{
+    __asm__ volatile(
+        "dsb sy"
+        :
+        :
+        : "memory"
+    );
+}
+
+/* ======================================================
+   FW_CFG
+   ====================================================== */
+
+#define FW_CFG_SIGNATURE 0x0000
+#define FW_CFG_ID        0x0001
+#define FW_CFG_FILE_DIR  0x0019
+
+#define FW_DMA_ERROR  0x01
+#define FW_DMA_SELECT 0x08
+#define FW_DMA_WRITE  0x10
+
+static volatile u8 *const fw_data =
+    (volatile u8 *)(FWCFG_BASE + 0);
+
+static volatile u16 *const fw_selector =
+    (volatile u16 *)(FWCFG_BASE + 8);
+
+static volatile u64 *const fw_dma_reg =
+    (volatile u64 *)(FWCFG_BASE + 16);
+
+struct fw_dma_desc {
+    u32 control;
+    u32 length;
+    u64 address;
+} __attribute__((packed, aligned(8)));
+
+static volatile struct fw_dma_desc dma_desc
+    __attribute__((aligned(8)));
+
+static u16 ramfb_selector;
+static u32 ramfb_size;
+
+static void fw_select(u16 selector)
+{
+    *fw_selector = be16(selector);
+    barrier();
+}
+
+static u8 fw_read8(void)
+{
+    return *fw_data;
+}
+
+static u16 fw_read_be16(void)
+{
+    u16 a = fw_read8();
+    u16 b = fw_read8();
+
+    return (u16)((a << 8) | b);
+}
+
+static u32 fw_read_be32(void)
+{
+    u32 a = fw_read8();
+    u32 b = fw_read8();
+    u32 c = fw_read8();
+    u32 d = fw_read8();
+
+    return
+        (a << 24) |
+        (b << 16) |
+        (c << 8) |
+        d;
+}
+
+static u32 fw_read_le32(void)
+{
+    u32 a = fw_read8();
+    u32 b = fw_read8();
+    u32 c = fw_read8();
+    u32 d = fw_read8();
+
+    return
+        a |
+        (b << 8) |
+        (c << 16) |
+        (d << 24);
+}
+
+static int fw_probe(void)
+{
+    u32 features;
+
+    print("Slate: probing fw_cfg...\n");
+
+    fw_select(FW_CFG_SIGNATURE);
+
+    if (fw_read8() != 'Q' ||
+        fw_read8() != 'E' ||
+        fw_read8() != 'M' ||
+        fw_read8() != 'U') {
+
+        print("Slate: fw_cfg signature failed 💀\n");
+        return 0;
+    }
+
+    print("Slate: fw_cfg = QEMU\n");
+
+    fw_select(FW_CFG_ID);
+    features = fw_read_le32();
+
+    print("Slate: fw_cfg features = ");
+    print_u32(features);
+    print("\n");
+
+    if (!(features & 2U)) {
+        print("Slate: DMA unsupported 💀\n");
+        return 0;
+    }
+
+    print("Slate: DMA supported 🔥\n");
+    return 1;
+}
+
+/* ======================================================
+   FIND etc/ramfb
+   ====================================================== */
+
+static int find_ramfb(void)
+{
+    static const char target[] = "etc/ramfb";
+
+    u32 count;
+    u32 entry;
+
+    fw_select(FW_CFG_FILE_DIR);
+
+    count = fw_read_be32();
+
+    print("fw_cfg: directory entries = ");
+    print_u32(count);
+    print("\n");
+
+    if (!count || count > 512)
+        return 0;
+
+    ramfb_selector = 0;
+    ramfb_size = 0;
+
+    for (entry = 0; entry < count; entry++) {
+        u32 size;
+        u16 selector;
+        u32 i;
+        int match = 1;
+
+        size = fw_read_be32();
+        selector = fw_read_be16();
+
+        fw_read8();
+        fw_read8();
+
+        for (i = 0; i < 56; i++) {
+            u8 c = fw_read8();
+
+            if (i < 9) {
+                if (c != (u8)target[i])
+                    match = 0;
+            } else if (i == 9) {
+                if (c != 0)
+                    match = 0;
+            }
+        }
+
+        if (match) {
+            ramfb_selector = selector;
+            ramfb_size = size;
+            break;
+        }
+    }
+
+    if (!ramfb_selector)
+        return 0;
+
+    print("fw_cfg: found etc/ramfb\n");
+    print("fw_cfg: selector = ");
+    print_hex16(ramfb_selector);
+    print("\n");
+
+    print("fw_cfg: ramfb config bytes = ");
+    print_u32(ramfb_size);
+    print("\n");
+
+    if (ramfb_size != 28U) {
+        print("Slate: weird ramfb size 💀\n");
+        return 0;
+    }
+
+    return 1;
+}
+
+/* ======================================================
+   RAMFB
+   ====================================================== */
+
+struct ramfb_cfg {
+    u64 addr;
+    u32 fourcc;
+    u32 flags;
+    u32 width;
+    u32 height;
+    u32 stride;
+} __attribute__((packed));
+
+static struct ramfb_cfg ramfb_cfg
+    __attribute__((aligned(8)));
+
+#define FOURCC_XR24 \
+    ((u32)'X' | \
+    ((u32)'R' << 8) | \
+    ((u32)'2' << 16) | \
+    ((u32)'4' << 24))
+
+static int dma_write(
+    u16 selector,
+    const void *buffer,
+    u32 length)
+{
+    u32 control;
+    u32 spins;
+
+    control =
+        ((u32)selector << 16) |
+        FW_DMA_SELECT |
+        FW_DMA_WRITE;
+
+    dma_desc.control = be32(control);
+    dma_desc.length  = be32(length);
+    dma_desc.address = be64((u64)buffer);
+
+    barrier();
+
+    print("Slate: firing fw_cfg DMA...\n");
+
+    *fw_dma_reg =
+        be64((u64)&dma_desc);
+
+    barrier();
+
+    print("Slate: DMA register survived 🔥\n");
+
+    for (spins = 0;
+         spins < 1000000U;
+         spins++) {
+
+        u32 result;
+
+        barrier();
+        result = be32(dma_desc.control);
+
+        if (result == 0) {
+            print("Slate: DMA COMPLETE 🔥\n");
+            return 1;
+        }
+
+        if (result & FW_DMA_ERROR) {
+            print("Slate: DMA ERROR 💀\n");
+            return 0;
+        }
+    }
+
+    print("Slate: DMA TIMEOUT 💀\n");
+    return 0;
+}
+
+static int ramfb_init(void)
+{
+    print("\n");
+    print("==============================\n");
+    print(" SLATE DISPLAY BRING-UP\n");
+    print("==============================\n");
+
+    if (!fw_probe())
+        return 0;
+
+    if (!find_ramfb()) {
+        print("Slate: etc/ramfb missing 💀\n");
+        return 0;
+    }
+
+    /*
+     * IMPORTANT:
+     *
+     * This innocent block is where the previous build
+     * disappeared.
+     *
+     * Pebble is now compiled with -mgeneral-regs-only,
+     * preventing GCC from sneaking FP/SIMD instructions
+     * into these structure stores.
+     */
+
+    print("Slate: preparing RAMFB config...\n");
+
+    ramfb_cfg.addr   = be64(FB_ADDR);
+    print("  addr ✓\n");
+
+    ramfb_cfg.fourcc = be32(FOURCC_XR24);
+    print("  fourcc ✓\n");
+
+    ramfb_cfg.flags  = be32(0);
+    print("  flags ✓\n");
+
+    ramfb_cfg.width  = be32(FB_WIDTH);
+    print("  width ✓\n");
+
+    ramfb_cfg.height = be32(FB_HEIGHT);
+    print("  height ✓\n");
+
+    ramfb_cfg.stride = be32(FB_STRIDE);
+    print("  stride ✓\n");
+
+    barrier();
+
+    print("Slate: RAMFB config survived 🔥\n");
+
+    if (!dma_write(
+            ramfb_selector,
+            &ramfb_cfg,
+            sizeof(ramfb_cfg))) {
+
+        return 0;
+    }
+
+    print("Slate: RAMFB ONLINE 🔥🔥🔥\n");
+    return 1;
+}
+
+/* ======================================================
+   GRAPHICS
+   ====================================================== */
+
+static u32 rgb(u8 r, u8 g, u8 b)
+{
+    return
+        ((u32)r << 16) |
+        ((u32)g << 8) |
+        b;
+}
+
+static void pixel(
+    int x,
+    int y,
+    u32 color)
+{
+    if (x < 0 ||
+        y < 0 ||
+        x >= (int)FB_WIDTH ||
+        y >= (int)FB_HEIGHT)
+        return;
+
+    fb[
+        (u32)y * FB_WIDTH +
+        (u32)x
+    ] = color;
+}
+
+static void rect(
+    int x,
+    int y,
+    int w,
+    int h,
+    u32 color)
+{
+    int xx;
+    int yy;
+
+    for (yy = 0; yy < h; yy++)
+        for (xx = 0; xx < w; xx++)
+            pixel(
+                x + xx,
+                y + yy,
+                color
+            );
+}
+
+static void fill(u32 color)
+{
+    u32 i;
+
+    for (i = 0;
+         i < FB_WIDTH * FB_HEIGHT;
+         i++)
+        fb[i] = color;
+
+    barrier();
+}
+
+static void circle(
+    int cx,
+    int cy,
+    int radius,
+    u32 color)
+{
+    int x;
+    int y;
+
+    for (y = -radius; y <= radius; y++) {
+        for (x = -radius; x <= radius; x++) {
+            if (x*x + y*y <= radius*radius)
+                pixel(
+                    cx + x,
+                    cy + y,
+                    color
+                );
+        }
+    }
+}
+
+/* ======================================================
+   FONT
+   ====================================================== */
+
+static const u8 font[][7] = {
+    {14,17,17,31,17,17,17},
+    {30,17,17,30,17,17,30},
+    {14,17,16,16,16,17,14},
+    {30,17,17,17,17,17,30},
+    {31,16,16,30,16,16,31},
+    {31,16,16,30,16,16,16},
+    {14,17,16,23,17,17,15},
+    {17,17,17,31,17,17,17},
+    {31,4,4,4,4,4,31},
+    {7,2,2,2,18,18,12},
+    {17,18,20,24,20,18,17},
+    {16,16,16,16,16,16,31},
+    {17,27,21,21,17,17,17},
+    {17,25,21,19,17,17,17},
+    {14,17,17,17,17,17,14},
+    {30,17,17,30,16,16,16},
+    {14,17,17,17,21,18,13},
+    {30,17,17,30,20,18,17},
+    {15,16,16,14,1,1,30},
+    {31,4,4,4,4,4,4},
+    {17,17,17,17,17,17,14},
+    {17,17,17,17,17,10,4},
+    {17,17,17,21,21,21,10},
+    {17,17,10,4,10,17,17},
+    {17,17,10,4,4,4,4},
+    {31,1,2,4,8,16,31}
+};
+
+static void letter(
+    int x,
+    int y,
+    char c,
+    int scale,
+    u32 color)
+{
+    int row;
+    int col;
+
+    if (c < 'A' || c > 'Z')
+        return;
+
+    for (row = 0; row < 7; row++) {
+        for (col = 0; col < 5; col++) {
+            if (
+                font[c-'A'][row] &
+                (1U << (4-col))) {
+
+                rect(
+                    x + col*scale,
+                    y + row*scale,
+                    scale,
+                    scale,
+                    color
+                );
+            }
+        }
+    }
+}
+
+static int text_width(
+    const char *s,
+    int scale)
+{
+    int n = 0;
+
+    while (*s++) n++;
+
+    return n * 6 * scale;
+}
+
+static void text(
+    int x,
+    int y,
+    const char *s,
+    int scale,
+    u32 color)
+{
+    while (*s) {
+        if (*s != ' ')
+            letter(
+                x,
+                y,
+                *s,
+                scale,
+                color
+            );
+
+        x += 6 * scale;
+        s++;
+    }
+}
+
+static void centered(
+    int y,
+    const char *s,
+    int scale,
+    u32 color)
+{
+    text(
+        ((int)FB_WIDTH -
+         text_width(s,scale)) / 2,
+        y,
+        s,
+        scale,
+        color
+    );
+}
+
+/* ======================================================
+   CHIP ANIMATION ENGINE 🪨
+   ====================================================== */
+
+static void chip(
+    int cx,
+    int cy,
+    int w,
+    int h,
+    int eyes_open)
+{
+    u32 rock = rgb(125,140,155);
+    u32 dark = rgb(20,27,34);
+
+    rect(
+        cx - w/2,
+        cy - h/2,
+        w,
+        h,
+        rock
+    );
+
+    rect(
+        cx - w/2 + 7,
+        cy - h/2 - 6,
+        w - 14,
+        6,
+        rock
+    );
+
+    if (eyes_open) {
+        circle(
+            cx - w/5,
+            cy - 4,
+            4,
+            dark
+        );
+
+        circle(
+            cx + w/5,
+            cy - 4,
+            4,
+            dark
+        );
+    } else {
+        rect(
+            cx - w/5 - 5,
+            cy - 3,
+            10,
+            2,
+            dark
+        );
+
+        rect(
+            cx + w/5 - 5,
+            cy - 3,
+            10,
+            2,
+            dark
+        );
+    }
+
+    rect(
+        cx - 13,
+        cy + h/5,
+        26,
+        3,
+        dark
+    );
+}
+
+static void pause_short(void)
+{
+    volatile u32 i;
+
+    for (i = 0;
+         i < 1200000U;
+         i++)
+        __asm__ volatile("nop");
+}
+
+static void pause_long(void)
+{
+    pause_short();
+    pause_short();
+    pause_short();
+}
+
+static void chip_wakeup(void)
+{
+    u32 bg = rgb(12,18,27);
+
+    print("Chip: zzz...\n");
+
+    fill(bg);
+    chip(320,220,80,45,0);
+    pause_long();
+
+    fill(bg);
+    chip(320,220,80,45,1);
+    pause_short();
+
+    fill(bg);
+    chip(320,220,80,45,0);
+    pause_short();
+
+    fill(bg);
+    chip(320,220,80,45,1);
+    pause_short();
+
+    print("Chip: ...wait\n");
+}
+
+static void chip_bounce(void)
+{
+    u32 bg = rgb(12,18,27);
+
+    /*
+     * normal
+     */
+    fill(bg);
+    chip(320,220,80,45,1);
+    pause_short();
+
+    /*
+     * squash
+     */
+    fill(bg);
+    chip(320,230,94,31,1);
+    pause_short();
+
+    /*
+     * launch
+     */
+    fill(bg);
+    chip(320,185,72,50,1);
+    pause_short();
+
+    /*
+     * higher
+     */
+    fill(bg);
+    chip(320,165,72,50,1);
+    pause_short();
+
+    /*
+     * land
+     */
+    fill(bg);
+    chip(320,230,96,29,1);
+    pause_short();
+
+    /*
+     * normal
+     */
+    fill(bg);
+    chip(320,220,80,45,1);
+
+    print("Chip: HOLY SHIT I CAN SEE\n");
+}
+
+/* ======================================================
+   BOOT SCREEN
+   ====================================================== */
+
+static void boot_screen(
+    u32 progress,
+    const char *stage)
+{
+    u32 bar;
+
+    fill(rgb(12,18,27));
+
+    centered(
+        48,
+        "PEBBLE",
+        5,
+        rgb(245,245,245)
+    );
+
+    chip(
+        320,
+        205,
+        80,
+        45,
+        1
+    );
+
+    rect(
+        100,
+        300,
+        440,
+        28,
+        rgb(40,50,62)
+    );
+
+    bar =
+        progress * 432U / 100U;
+
+    rect(
+        104,
+        304,
+        (int)bar,
+        20,
+        rgb(220,230,238)
+    );
+
+    centered(
+        355,
+        stage,
+        2,
+        rgb(215,225,235)
+    );
+
+    barrier();
+}
+
+/* ======================================================
+   PEBBLE SHORE
+   ====================================================== */
+
+static void draw_shore(void)
+{
+    u32 x;
+    u32 y;
+    usize p = 0;
+
+    print("Slate: releasing the beach 🏝️\n");
+
+    for (y = 0;
+         y < FB_HEIGHT;
+         y++) {
+
+        for (x = 0;
+             x < FB_WIDTH;
+             x++) {
+
+            u8 r =
+                pebble_shore_rgb[p++];
+
+            u8 g =
+                pebble_shore_rgb[p++];
+
+            u8 b =
+                pebble_shore_rgb[p++];
+
+            fb[
+                y * FB_WIDTH + x
+            ] = rgb(r,g,b);
+        }
+    }
+
+    barrier();
+}
+
+/* ======================================================
+   LOCK SCREEN
+   ====================================================== */
+
+static void lock_screen(void)
+{
+    /*
+     * shadow
+     */
+    rect(
+        180,
+        108,
+        288,
+        270,
+        rgb(20,25,32)
+    );
+
+    /*
+     * card
+     */
+    rect(
+        172,
+        100,
+        288,
+        270,
+        rgb(238,242,245)
+    );
+
+    centered(
+        128,
+        "PEBBLE",
+        3,
+        rgb(30,38,48)
+    );
+
+    chip(
+        320,
+        215,
+        68,
+        39,
+        1
+    );
+
+    circle(
+        275,
+        290,
+        7,
+        rgb(55,65,75)
+    );
+
+    circle(
+        305,
+        290,
+        7,
+        rgb(55,65,75)
+    );
+
+    circle(
+        335,
+        290,
+        7,
+        rgb(55,65,75)
+    );
+
+    circle(
+        365,
+        290,
+        7,
+        rgb(55,65,75)
+    );
+
+    centered(
+        326,
+        "WELCOME",
+        2,
+        rgb(50,60,70)
+    );
+
+    barrier();
+}
+
+/* ======================================================
+   PEBBLE MAIN
+   ====================================================== */
+
+void pebble_main(void)
+{
+    print(
+        "\n"
+        "====================================\n"
+        "       PEBBLE 0.5 - SLATE\n"
+        "====================================\n"
+    );
+
+    print("[ OK ] Pebble kernel\n");
+    print("[ .. ] Looking for pixels\n");
+
+    if (!ramfb_init()) {
+        print(
+            "\n"
+            "💀 Slate graphics failed\n"
+            "Chip: I STILL CANNOT SEE\n"
+        );
+
+        for (;;)
+            __asm__ volatile("wfe");
+    }
+
+    print("[ OK ] Slate framebuffer\n");
+
+    /*
+     * FIRST ACTUAL PIXELS.
+     */
+
+    fill(rgb(12,18,27));
+
+    print("[ OK ] Framebuffer memory writable\n");
+
+    /*
+     * CHIP AWAKENS.
+     */
+
+    chip_wakeup();
+    chip_bounce();
+
+    /*
+     * REAL BOOT STAGES.
+     */
+
+    boot_screen(
+        10,
+        "KERNEL"
+    );
+
+    print("[SLATE 10%] Kernel\n");
+    pause_short();
+
+    boot_screen(
+        25,
+        "DISPLAY"
+    );
+
+    print("[SLATE 25%] Display\n");
+    pause_short();
+
+    boot_screen(
+        40,
+        "CHALK"
+    );
+
+    print("[SLATE 40%] Chalk\n");
+    pause_short();
+
+    boot_screen(
+        55,
+        "AMETHYST"
+    );
+
+    print("[SLATE 55%] Amethyst\n");
+    pause_short();
+
+    boot_screen(
+        70,
+        "STONEYARD"
+    );
+
+    print("[SLATE 70%] Stoneyard\n");
+    pause_short();
+
+    boot_screen(
+        85,
+        "WAKING CHIP"
+    );
+
+    print("[SLATE 85%] Chip\n");
+    pause_short();
+
+    boot_screen(
+        100,
+        "READY"
+    );
+
+    print("[SLATE 100%] Ready\n");
+    pause_long();
+
+    /*
+     * BEACH.
+     */
+
+    draw_shore();
+
+    print("[ OK ] Pebble Shore\n");
+
+    /*
+     * LOCK SCREEN.
+     */
+
+    lock_screen();
+
+    print("[ OK ] Slate lock screen\n");
+
+    print(
+        "\n"
+        "Chip: BEACH EPISODE 🔥\n"
+        "\n"
+        "====================================\n"
+        "   THE ROCK HAS A SCREEN\n"
+        "====================================\n"
+    );
+
+    for (;;)
+        __asm__ volatile("wfe");
+}
