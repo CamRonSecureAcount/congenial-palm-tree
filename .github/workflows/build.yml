@@ -1,4 +1,4 @@
-name: "🪨 Pebble 0.5.0 — Slate"
+name: "🪨 Pebble 0.5.1 — Slate Graphics"
 
 on:
   workflow_dispatch:
@@ -6,104 +6,67 @@ on:
     branches: ["main"]
 
 jobs:
-  slate:
-    name: "🪨 Build Pebble 0.5 — Slate"
+  graphics:
     runs-on: ubuntu-latest
 
     steps:
-      - name: "📦 Checkout Pebble"
+      - name: "📦 Checkout"
         uses: actions/checkout@v4
 
       - name: "🔧 Install tools"
-        shell: bash
         run: |
           set -e
-
           sudo apt-get update
           sudo apt-get install -y \
             gcc-aarch64-linux-gnu \
             binutils-aarch64-linux-gnu \
             qemu-system-arm \
             imagemagick \
-            xxd
-
-          echo "🪨 Slate kitchen ready."
-
-      # ============================================================
-      # PEBBLE SHORE
-      # ============================================================
-
-      - name: "🏝️ Cook Pebble Shore"
-        shell: bash
-        run: |
-          set -e
+            xxd \
+            socat
 
           mkdir -p src build/wallpaper release
 
-          WALLPAPER="assets/IMG_1526.gif"
+      # ============================================================
+      # WALLPAPER
+      # ============================================================
 
-          echo "========================================"
-          echo "       PEBBLE WALLPAPER KITCHEN"
-          echo "========================================"
+      - name: "🏝️ Cook Pebble Shore"
+        run: |
+          set -e
 
-          if [ ! -f "$WALLPAPER" ]; then
+          test -f assets/IMG_1526.gif || {
             echo "💀 WHERE THE FUCK IS THE BEACH"
-            echo "Expected: $WALLPAPER"
             exit 1
-          fi
+          }
 
-          echo "🏝️ Found $WALLPAPER"
-
-          FRAME_COUNT="$(identify "$WALLPAPER" | wc -l)"
-          echo "🎞️ GIF contains $FRAME_COUNT frames"
-
-          echo "🏝️ Extracting Slate boot wallpaper..."
-
-          convert "${WALLPAPER}[0]" \
+          convert "assets/IMG_1526.gif[0]" \
             -resize '640x480!' \
             -alpha off \
             build/wallpaper/shore.png
-
-          echo "🎨 Converting beach to RGB..."
 
           convert build/wallpaper/shore.png \
             -depth 8 \
             RGB:build/wallpaper/shore.rgb
 
-          EXPECTED=$((640 * 480 * 3))
-          ACTUAL="$(wc -c < build/wallpaper/shore.rgb)"
+          SIZE="$(wc -c < build/wallpaper/shore.rgb)"
+          echo "Wallpaper bytes: $SIZE"
 
-          echo "Expected RGB bytes: $EXPECTED"
-          echo "Actual RGB bytes:   $ACTUAL"
+          test "$SIZE" -eq 921600
 
-          if [ "$ACTUAL" -ne "$EXPECTED" ]; then
-            echo "💀 Wallpaper RGB size is wrong."
-            exit 1
-          fi
-
-          echo "🪨 Embedding Pebble Shore..."
-
-          (
-            cd build/wallpaper
-            xxd -i shore.rgb > ../../src/pebble_shore.h
-          )
-
-          echo "✓ Pebble Shore cooked."
-          echo "Chip: BEACH ACQUIRED 🏝️"
+          cd build/wallpaper
+          xxd -i shore.rgb > ../../src/pebble_shore.h
 
       # ============================================================
-      # GENERATE THE ACTUAL PEBBLE SOURCE
+      # GENERATE PEBBLE
       # ============================================================
 
-      - name: "🧱 Generate Slate"
-        shell: bash
+      - name: "🧱 Generate Slate Graphics"
         run: |
           set -e
 
-          mkdir -p src build release
-
           # --------------------------------------------------------
-          # BOOT.S
+          # BOOT
           # --------------------------------------------------------
 
           cat > src/boot.S <<'EOF'
@@ -136,7 +99,7 @@ jobs:
 
           .section ".bss"
           .align 12
-          .skip 32768
+          .skip 65536
           stack_top:
           EOF
 
@@ -175,41 +138,8 @@ jobs:
                   __bss_end = .;
               }
 
-              . = ALIGN(4096);
               __kernel_end = .;
           }
-          EOF
-
-          # --------------------------------------------------------
-          # SLATE BOOT STATE
-          # --------------------------------------------------------
-
-          cat > src/slate.h <<'EOF'
-          #ifndef PEBBLE_SLATE_H
-          #define PEBBLE_SLATE_H
-
-          typedef struct {
-              unsigned int progress;
-              const char *message;
-              const char *chip;
-          } slate_stage_t;
-
-          static const slate_stage_t slate_stages[] = {
-              {  5, "Starting Pebble",      "Chip: ...zzz" },
-              { 15, "Starting kernel",      "Chip: huh?" },
-              { 28, "Starting display",     "Chip: OOO COLORS" },
-              { 42, "Loading Chalk",        "Chip: security rock deployed." },
-              { 57, "Mounting Amethyst",    "Chip: shiny filesystem time." },
-              { 70, "Starting Stoneyard",   "Chip: packages acquired." },
-              { 84, "Loading Pebble Shore", "Chip: BEACH EPISODE!" },
-              { 94, "Waking Chip",          "Chip: five more minutes..." },
-              {100, "Ready",                "Chip: LET'S ROCK." }
-          };
-
-          #define SLATE_STAGE_COUNT \
-              (sizeof(slate_stages) / sizeof(slate_stages[0]))
-
-          #endif
           EOF
 
           # --------------------------------------------------------
@@ -217,16 +147,47 @@ jobs:
           # --------------------------------------------------------
 
           cat > src/kernel.c <<'EOF'
-          typedef unsigned int u32;
-          typedef unsigned long u64;
-          typedef unsigned long usize;
+          typedef unsigned char      u8;
+          typedef unsigned short     u16;
+          typedef unsigned int       u32;
+          typedef unsigned long      u64;
+          typedef unsigned long      usize;
 
-          #include "slate.h"
           #include "pebble_shore.h"
 
-          #define UART_BASE 0x09000000UL
+          /* ======================================================
+             HARDWARE
+             ====================================================== */
+
+          #define UART_BASE   0x09000000UL
+          #define FWCFG_BASE  0x09020000UL
+
           #define UART_DR (*(volatile u32 *)(UART_BASE + 0x00))
           #define UART_FR (*(volatile u32 *)(UART_BASE + 0x18))
+
+          /*
+           * Put framebuffer well above the kernel.
+           *
+           * QEMU virt RAM:
+           *   0x40000000 ...
+           *
+           * Pebble:
+           *   ~0x40080000
+           *
+           * Framebuffer:
+           *   0x44000000
+           */
+          #define FB_ADDR   0x44000000UL
+          #define FB_WIDTH  640
+          #define FB_HEIGHT 480
+          #define FB_STRIDE (FB_WIDTH * 4)
+
+          static volatile u32 *fb =
+              (volatile u32 *)FB_ADDR;
+
+          /* ======================================================
+             UART
+             ====================================================== */
 
           static void putc(char c)
           {
@@ -246,617 +207,821 @@ jobs:
                   putc(*s++);
           }
 
-          static void print_uint(unsigned int value)
+          static void print_uint(u32 n)
           {
-              char buffer[16];
-              unsigned int i = 0;
+              char buf[16];
+              u32 i = 0;
 
-              if (value == 0) {
+              if (!n) {
                   putc('0');
                   return;
               }
 
-              while (value && i < sizeof(buffer)) {
-                  buffer[i++] = (char)('0' + (value % 10));
-                  value /= 10;
+              while (n) {
+                  buf[i++] = '0' + (n % 10);
+                  n /= 10;
               }
 
               while (i)
-                  putc(buffer[--i]);
+                  putc(buf[--i]);
           }
 
-          static int eq(const char *a, const char *b)
-          {
-              while (*a && *b && *a == *b) {
-                  a++;
-                  b++;
-              }
+          /* ======================================================
+             ENDIAN
+             ====================================================== */
 
-              return *a == *b;
+          static u16 be16(u16 x)
+          {
+              return (u16)((x >> 8) | (x << 8));
           }
 
-          static int starts(const char *s, const char *p)
+          static u32 be32(u32 x)
           {
-              while (*p) {
-                  if (*s++ != *p++)
+              return __builtin_bswap32(x);
+          }
+
+          static u64 be64(u64 x)
+          {
+              return __builtin_bswap64(x);
+          }
+
+          static void barrier(void)
+          {
+              __asm__ volatile("dsb sy" ::: "memory");
+          }
+
+          /* ======================================================
+             FW_CFG
+             ====================================================== */
+
+          #define FW_CFG_FILE_DIR 0x0019
+
+          #define FW_CFG_DMA_ERROR  0x01
+          #define FW_CFG_DMA_READ   0x02
+          #define FW_CFG_DMA_SKIP   0x04
+          #define FW_CFG_DMA_SELECT 0x08
+          #define FW_CFG_DMA_WRITE  0x10
+
+          struct fw_dma {
+              u32 control;
+              u32 length;
+              u64 address;
+          } __attribute__((packed, aligned(8)));
+
+          static volatile struct fw_dma dma;
+
+          static void fw_select(u16 selector)
+          {
+              volatile u16 *reg =
+                  (volatile u16 *)(FWCFG_BASE + 8);
+
+              *reg = be16(selector);
+              barrier();
+          }
+
+          static u8 fw_read8(void)
+          {
+              volatile u8 *data =
+                  (volatile u8 *)(FWCFG_BASE + 0);
+
+              return *data;
+          }
+
+          static u32 read_be32_stream(void)
+          {
+              u32 a = fw_read8();
+              u32 b = fw_read8();
+              u32 c = fw_read8();
+              u32 d = fw_read8();
+
+              return
+                  (a << 24) |
+                  (b << 16) |
+                  (c << 8)  |
+                   d;
+          }
+
+          static u16 read_be16_stream(void)
+          {
+              u16 a = fw_read8();
+              u16 b = fw_read8();
+
+              return (u16)((a << 8) | b);
+          }
+
+          static int name_is_ramfb(const char *name)
+          {
+              const char target[] = "etc/ramfb";
+              u32 i;
+
+              for (i = 0; target[i]; i++) {
+                  if (name[i] != target[i])
                       return 0;
               }
 
-              return 1;
+              return name[i] == 0;
           }
 
-          /* ======================================================
-             SLATE
-             ====================================================== */
-
-          static unsigned int slate_progress = 0;
-
-          static void slate_stage(unsigned int index)
+          static u16 find_ramfb(void)
           {
-              const slate_stage_t *stage;
+              u32 count;
+              u32 i;
 
-              if (index >= SLATE_STAGE_COUNT)
-                  return;
+              fw_select(FW_CFG_FILE_DIR);
 
-              stage = &slate_stages[index];
-              slate_progress = stage->progress;
+              count = read_be32_stream();
 
-              print("[SLATE ");
-              print_uint(stage->progress);
-              print("%] ");
-
-              print(stage->message);
-              print("\n       ");
-
-              print(stage->chip);
-              print("\n");
-          }
-
-          static void slate_boot(void)
-          {
-              unsigned int i;
-
-              print(
-                  "\n"
-                  "====================================\n"
-                  "          SLATE BOOT SYSTEM\n"
-                  "====================================\n"
-              );
-
-              for (i = 0; i < SLATE_STAGE_COUNT; i++)
-                  slate_stage(i);
-
-              print("\nSlate: loader reached 100%.\n");
-          }
-
-          static void slate_wallpaper_probe(void)
-          {
-              usize expected = 640UL * 480UL * 3UL;
-
-              print("\nSlate: checking Pebble Shore...\n");
-
-              print("Slate: wallpaper bytes = ");
-              print_uint(shore_rgb_len);
+              print("fw_cfg: directory entries = ");
+              print_uint(count);
               print("\n");
 
-              if ((usize)shore_rgb_len == expected) {
-                  print("Slate: Pebble Shore is ready.\n");
+              if (count > 512)
+                  return 0;
 
-                  /*
-                   * Read a few bytes so the compiler/linker cannot
-                   * discard our beautiful beach.
-                   */
-                  if (shore_rgb[0] ||
-                      shore_rgb[1] ||
-                      shore_rgb[2]) {
-                      print("Chip: yep. that's definitely pixels.\n");
-                  } else {
-                      print("Chip: first pixel is suspiciously dark.\n");
+              for (i = 0; i < count; i++) {
+                  u32 size;
+                  u16 selector;
+                  u32 j;
+                  char name[57];
+
+                  size = read_be32_stream();
+                  selector = read_be16_stream();
+
+                  /* reserved */
+                  fw_read8();
+                  fw_read8();
+
+                  for (j = 0; j < 56; j++)
+                      name[j] = (char)fw_read8();
+
+                  name[56] = 0;
+
+                  if (name_is_ramfb(name)) {
+                      print("fw_cfg: found etc/ramfb\n");
+                      print("fw_cfg: ramfb config bytes = ");
+                      print_uint(size);
+                      print("\n");
+
+                      return selector;
                   }
-              } else {
-                  print("Slate: wallpaper size mismatch 💀\n");
               }
+
+              return 0;
+          }
+
+          static int fw_dma_write(
+              u16 selector,
+              const void *buffer,
+              u32 length)
+          {
+              volatile u64 *dma_reg =
+                  (volatile u64 *)(FWCFG_BASE + 16);
+
+              u32 control =
+                  ((u32)selector << 16) |
+                  FW_CFG_DMA_SELECT |
+                  FW_CFG_DMA_WRITE;
+
+              dma.control = be32(control);
+              dma.length  = be32(length);
+              dma.address = be64((u64)buffer);
+
+              barrier();
+
+              /*
+               * fw_cfg's DMA address register is big-endian.
+               */
+              *dma_reg = be64((u64)&dma);
+
+              barrier();
+
+              /*
+               * Current QEMU completes this synchronously,
+               * but still wait according to the interface contract.
+               */
+              {
+                  u32 spins = 1000000;
+
+                  while (spins--) {
+                      u32 result;
+
+                      barrier();
+                      result = be32(dma.control);
+
+                      if (result == 0)
+                          return 1;
+
+                      if (result & FW_CFG_DMA_ERROR)
+                          return 0;
+                  }
+              }
+
+              return 0;
           }
 
           /* ======================================================
-             CHALK GUARDIAN
+             RAMFB
              ====================================================== */
 
-          #define CAP_CONSOLE  (1ULL << 0)
-          #define CAP_FILES    (1ULL << 1)
-          #define CAP_NETWORK  (1ULL << 2)
-          #define CAP_POWER    (1ULL << 3)
-          #define CAP_ADMIN    (1ULL << 4)
+          struct ramfb_cfg {
+              u64 addr;
+              u32 fourcc;
+              u32 flags;
+              u32 width;
+              u32 height;
+              u32 stride;
+          } __attribute__((packed));
 
-          #define DANGER (CAP_POWER | CAP_ADMIN)
+          /*
+           * DRM_FORMAT_XRGB8888
+           * fourcc('X','R','2','4')
+           */
+          #define FOURCC_XR24 \
+              ((u32)'X' | ((u32)'R' << 8) | \
+              ((u32)'2' << 16) | ((u32)'4' << 24))
 
-          static int chalk_enabled = 1;
-
-          static int chalk_scan(const char *name, u64 caps)
+          static int ramfb_init(void)
           {
-              print("\nChalk: scanning ");
-              print(name);
-              print("...\n");
+              u16 selector;
+              struct ramfb_cfg cfg;
 
-              if (!chalk_enabled) {
-                  print("Chalk: disabled. you're on your own 💀\n");
-                  return 1;
-              }
+              print("Slate: locating ramfb...\n");
 
-              if (caps & DANGER) {
-                  print("Chalk: absolutely not.\n");
+              selector = find_ramfb();
 
-                  if (caps & CAP_POWER)
-                      print("  [!] system.power\n");
-
-                  if (caps & CAP_ADMIN)
-                      print("  [!] system.admin\n");
-
-                  print("CHALK: BLOCKED\n");
+              if (!selector) {
+                  print("Slate: etc/ramfb NOT FOUND 💀\n");
                   return 0;
               }
 
-              print("Chalk: looks edible enough.\n");
-              print("CHALK: CLEAR\n");
+              cfg.addr   = be64(FB_ADDR);
+              cfg.fourcc = be32(FOURCC_XR24);
+              cfg.flags  = be32(0);
+              cfg.width  = be32(FB_WIDTH);
+              cfg.height = be32(FB_HEIGHT);
+              cfg.stride = be32(FB_STRIDE);
 
+              print("Slate: configuring 640x480 XR24...\n");
+
+              if (!fw_dma_write(
+                      selector,
+                      &cfg,
+                      sizeof(cfg))) {
+
+                  print("Slate: ramfb DMA write FAILED 💀\n");
+                  return 0;
+              }
+
+              print("Slate: RAMFB ONLINE 🔥\n");
               return 1;
           }
 
           /* ======================================================
-             STP / STONEYARD
+             PIXELS
              ====================================================== */
 
-          struct stp {
-              char magic[4];
-
-              const char *name;
-              const char *version;
-              const char *description;
-
-              u64 capabilities;
-
-              const char *provides;
-          };
-
-          static struct stp repo[] = {
-              {
-                  {'S','T','P','K'},
-                  "chicken",
-                  "1.0",
-                  "An extremely important chicken.",
-                  CAP_CONSOLE,
-                  "chicken.px"
-              },
-
-              {
-                  {'S','T','P','K'},
-                  "chip",
-                  "0.5",
-                  "Pebble emotional support mineral.",
-                  CAP_CONSOLE,
-                  "chip.px"
-              },
-
-              {
-                  {'S','T','P','K'},
-                  "editor",
-                  "0.1",
-                  "Tiny Pebble text editor.",
-                  CAP_CONSOLE | CAP_FILES,
-                  "editor.px"
-              },
-
-              {
-                  {'S','T','P','K'},
-                  "free-nuggets-real",
-                  "6.6.6",
-                  "Definitely trustworthy.",
-                  CAP_CONSOLE | CAP_POWER | CAP_ADMIN,
-                  "totally_safe.px"
-              }
-          };
-
-          #define REPO_COUNT \
-              (sizeof(repo) / sizeof(repo[0]))
-
-          #define MAX_INSTALLED 16
-
-          static struct stp *installed[MAX_INSTALLED];
-          static usize installed_count = 0;
-
-          static struct stp *find_package(const char *name)
+          static u32 rgb(u8 r, u8 g, u8 b)
           {
-              usize i;
-
-              for (i = 0; i < REPO_COUNT; i++) {
-                  if (eq(repo[i].name, name))
-                      return &repo[i];
-              }
-
-              return 0;
+              /*
+               * XR24 on little endian:
+               *
+               * memory = B G R X
+               */
+              return
+                  ((u32)r << 16) |
+                  ((u32)g << 8) |
+                  ((u32)b);
           }
 
-          static int already_installed(struct stp *p)
+          static void pixel(
+              int x,
+              int y,
+              u32 color)
           {
-              usize i;
+              if (x < 0 ||
+                  y < 0 ||
+                  x >= FB_WIDTH ||
+                  y >= FB_HEIGHT)
+                  return;
 
-              for (i = 0; i < installed_count; i++) {
-                  if (installed[i] == p)
-                      return 1;
-              }
-
-              return 0;
+              fb[y * FB_WIDTH + x] = color;
           }
 
-          static void stpack_install(const char *name)
+          static void rect(
+              int x,
+              int y,
+              int w,
+              int h,
+              u32 color)
           {
-              struct stp *p;
+              int yy;
+              int xx;
 
-              print("\nstpack: searching Stoneyard...\n");
-
-              p = find_package(name);
-
-              if (!p) {
-                  print("stpack: package not found.\n");
-                  print("Chip: maybe it rolled away?\n");
-                  return;
+              for (yy = y; yy < y + h; yy++) {
+                  for (xx = x; xx < x + w; xx++)
+                      pixel(xx, yy, color);
               }
-
-              print("stpack: found ");
-              print(p->name);
-              print("-");
-              print(p->version);
-              print(".stp\n");
-
-              if (already_installed(p)) {
-                  print("stpack: already installed 😭\n");
-                  return;
-              }
-
-              if (!chalk_scan(p->name, p->capabilities)) {
-                  print("stpack: installation cancelled.\n");
-                  print("Chip: yeahhhh I wouldn't eat that one.\n");
-                  return;
-              }
-
-              if (installed_count >= MAX_INSTALLED) {
-                  print("stpack: package store full.\n");
-                  return;
-              }
-
-              print("\nstpack: unpacking");
-              print("...............\n");
-
-              installed[installed_count++] = p;
-
-              print("stpack: installed ");
-              print(p->name);
-              print(" successfully.\n");
-
-              if (eq(p->name, "chicken"))
-                  print("stpack: chicken acquired. [nugget pending]\n");
-
-              if (eq(p->name, "chip"))
-                  print("Chip: wait... you installed ME?\n");
           }
 
-          static void stpack_remove(const char *name)
+          static void fill(u32 color)
           {
-              usize i;
+              u32 i;
 
-              for (i = 0; i < installed_count; i++) {
-                  if (eq(installed[i]->name, name)) {
-                      usize j;
+              for (i = 0;
+                   i < FB_WIDTH * FB_HEIGHT;
+                   i++)
+                  fb[i] = color;
+          }
 
-                      for (j = i; j + 1 < installed_count; j++)
-                          installed[j] = installed[j + 1];
+          static void circle(
+              int cx,
+              int cy,
+              int radius,
+              u32 color)
+          {
+              int x;
+              int y;
 
-                      installed_count--;
-
-                      print("stpack: removed ");
-                      print(name);
-                      print(".\n");
-
-                      if (eq(name, "chip"))
-                          print("Chip: WAIT COME BACK—\n");
-
-                      return;
+              for (y = -radius; y <= radius; y++) {
+                  for (x = -radius; x <= radius; x++) {
+                      if ((x*x + y*y) <= radius*radius)
+                          pixel(cx+x, cy+y, color);
                   }
               }
-
-              print("stpack: that package isn't installed.\n");
-          }
-
-          static void stpack_list(void)
-          {
-              usize i;
-
-              print("\nInstalled packages:\n");
-
-              if (!installed_count) {
-                  print("  nothing. absolutely barren.\n");
-                  return;
-              }
-
-              for (i = 0; i < installed_count; i++) {
-                  print("  ");
-                  print(installed[i]->name);
-                  print(" ");
-                  print(installed[i]->version);
-                  print("\n");
-              }
-          }
-
-          static void stpack_search(void)
-          {
-              usize i;
-
-              print("\nStoneyard packages:\n");
-
-              for (i = 0; i < REPO_COUNT; i++) {
-                  print("  ");
-                  print(repo[i].name);
-                  print(" ");
-                  print(repo[i].version);
-                  print(" - ");
-                  print(repo[i].description);
-                  print("\n");
-              }
-          }
-
-          static void stpack_info(const char *name)
-          {
-              struct stp *p = find_package(name);
-
-              if (!p) {
-                  print("stpack: package not found.\n");
-                  return;
-              }
-
-              print("\nPackage: ");
-              print(p->name);
-
-              print("\nVersion: ");
-              print(p->version);
-
-              print("\nProvides: ");
-              print(p->provides);
-
-              print("\nAbout: ");
-              print(p->description);
-
-              print("\n");
           }
 
           /* ======================================================
-             STONE
+             TINY FONT
              ====================================================== */
 
-          static char command[256];
+          static const u8 font[][7] = {
+              /* A */
+              {14,17,17,31,17,17,17},
 
-          static char getc(void)
+              /* B */
+              {30,17,17,30,17,17,30},
+
+              /* C */
+              {14,17,16,16,16,17,14},
+
+              /* D */
+              {30,17,17,17,17,17,30},
+
+              /* E */
+              {31,16,16,30,16,16,31},
+
+              /* F */
+              {31,16,16,30,16,16,16},
+
+              /* G */
+              {14,17,16,23,17,17,15},
+
+              /* H */
+              {17,17,17,31,17,17,17},
+
+              /* I */
+              {31,4,4,4,4,4,31},
+
+              /* J */
+              {7,2,2,2,18,18,12},
+
+              /* K */
+              {17,18,20,24,20,18,17},
+
+              /* L */
+              {16,16,16,16,16,16,31},
+
+              /* M */
+              {17,27,21,21,17,17,17},
+
+              /* N */
+              {17,25,21,19,17,17,17},
+
+              /* O */
+              {14,17,17,17,17,17,14},
+
+              /* P */
+              {30,17,17,30,16,16,16},
+
+              /* Q */
+              {14,17,17,17,21,18,13},
+
+              /* R */
+              {30,17,17,30,20,18,17},
+
+              /* S */
+              {15,16,16,14,1,1,30},
+
+              /* T */
+              {31,4,4,4,4,4,4},
+
+              /* U */
+              {17,17,17,17,17,17,14},
+
+              /* V */
+              {17,17,17,17,17,10,4},
+
+              /* W */
+              {17,17,17,21,21,21,10},
+
+              /* X */
+              {17,17,10,4,10,17,17},
+
+              /* Y */
+              {17,17,10,4,4,4,4},
+
+              /* Z */
+              {31,1,2,4,8,16,31}
+          };
+
+          static void letter(
+              int x,
+              int y,
+              char c,
+              int scale,
+              u32 color)
           {
-              while (UART_FR & (1u << 4)) {}
-              return (char)(UART_DR & 0xff);
-          }
+              int row;
+              int col;
+              const u8 *glyph;
 
-          static void read_command(void)
-          {
-              usize i = 0;
+              if (c < 'A' || c > 'Z')
+                  return;
 
-              for (;;) {
-                  char c = getc();
+              glyph = font[c - 'A'];
 
-                  if (c == '\n' || c == '\r') {
-                      command[i] = 0;
-                      putc('\n');
-                      return;
-                  }
+              for (row = 0; row < 7; row++) {
+                  for (col = 0; col < 5; col++) {
+                      if (glyph[row] &
+                          (1 << (4-col))) {
 
-                  if ((c == 8 || c == 127) && i) {
-                      i--;
-                      print("\b \b");
-                      continue;
-                  }
-
-                  if (c >= 32 &&
-                      c <= 126 &&
-                      i < sizeof(command) - 1) {
-
-                      command[i++] = c;
-                      putc(c);
+                          rect(
+                              x + col*scale,
+                              y + row*scale,
+                              scale,
+                              scale,
+                              color
+                          );
+                      }
                   }
               }
           }
 
-          static void chip(void)
+          static int text_width(
+              const char *s,
+              int scale)
           {
-              print(
-                  "\n"
-                  "       ___\n"
-                  "     /     \\\n"
-                  "    | o   o |\n"
-                  "    |   v   |\n"
-                  "     \\_____/\n"
-                  "      /   \\\n"
-                  "\n"
-                  "Chip: BEACH EPISODE 🔥\n"
+              int n = 0;
+
+              while (*s++) n++;
+
+              return n * 6 * scale;
+          }
+
+          static void text(
+              int x,
+              int y,
+              const char *s,
+              int scale,
+              u32 color)
+          {
+              while (*s) {
+                  if (*s != ' ')
+                      letter(x, y, *s, scale, color);
+
+                  x += 6 * scale;
+                  s++;
+              }
+          }
+
+          static void centered(
+              int y,
+              const char *s,
+              int scale,
+              u32 color)
+          {
+              int w = text_width(s, scale);
+
+              text(
+                  (FB_WIDTH - w) / 2,
+                  y,
+                  s,
+                  scale,
+                  color
               );
           }
 
-          static void help(void)
+          /* ======================================================
+             SLATE LOADER
+             ====================================================== */
+
+          static void draw_rock(
+              int cx,
+              int cy,
+              int size,
+              u32 color)
           {
-              print(
-                  "\n"
-                  "Stone 0.5\n"
-                  "---------\n"
-                  "help\n"
-                  "about\n"
-                  "chip\n"
-                  "slate status\n"
-                  "slate boot\n"
-                  "wallpaper status\n"
-                  "chalk status\n"
-                  "chalk disable\n"
-                  "chalk enable\n"
-                  "stpack search\n"
-                  "stpack list\n"
-                  "stpack info <package>\n"
-                  "stpack install <package>\n"
-                  "stpack remove <package>\n"
-                  "\n"
+              rect(
+                  cx - size,
+                  cy - size/2,
+                  size*2,
+                  size,
+                  color
+              );
+
+              rect(
+                  cx - size + 5,
+                  cy - size/2 - 5,
+                  size*2 - 10,
+                  5,
+                  color
+              );
+
+              rect(
+                  cx - size + 8,
+                  cy + size/2,
+                  size*2 - 16,
+                  4,
+                  color
               );
           }
 
-          static void execute(void)
+          static void slate_loader(u32 progress)
           {
-              if (eq(command, "help"))
-                  help();
+              int bar_width;
 
-              else if (eq(command, "about")) {
-                  print(
-                      "Pebble 0.5.0 \"Slate\"\n"
-                      "Stone 0.5\n"
-                      "Slate 0.5\n"
-                      "stpack 0.1\n"
-                      "Chalk Guardian 0.1\n"
-                      "Amethyst: bootstrap stage\n"
-                      "Wallpaper: Pebble Shore\n"
-                  );
-              }
+              fill(rgb(12, 18, 27));
 
-              else if (eq(command, "chip"))
-                  chip();
+              centered(
+                  55,
+                  "PEBBLE",
+                  5,
+                  rgb(245,245,245)
+              );
 
-              else if (eq(command, "slate status")) {
-                  print("Slate: ACTIVE\n");
-                  print("Slate progress: ");
-                  print_uint(slate_progress);
-                  print("%\n");
-                  print("Display driver: pending framebuffer handshake\n");
-              }
+              draw_rock(
+                  320,
+                  190,
+                  45,
+                  rgb(120,135,150)
+              );
 
-              else if (eq(command, "slate boot"))
-                  slate_boot();
+              circle(
+                  302,
+                  183,
+                  4,
+                  rgb(20,25,30)
+              );
 
-              else if (eq(command, "wallpaper status"))
-                  slate_wallpaper_probe();
+              circle(
+                  338,
+                  183,
+                  4,
+                  rgb(20,25,30)
+              );
 
-              else if (eq(command, "chalk status")) {
-                  if (chalk_enabled)
-                      print("Chalk Guardian: ACTIVE\n");
-                  else
-                      print("Chalk Guardian: DISABLED 💀\n");
-              }
+              rect(
+                  304,
+                  215,
+                  32,
+                  5,
+                  rgb(80,95,110)
+              );
 
-              else if (eq(command, "chalk disable")) {
-                  chalk_enabled = 0;
+              rect(
+                  120,
+                  300,
+                  400,
+                  24,
+                  rgb(40,50,62)
+              );
 
-                  print(
-                      "Chalk: protection disabled until reboot.\n"
-                      "Chip: this seems like a questionable decision.\n"
-                  );
-              }
+              bar_width =
+                  (int)((progress * 392) / 100);
 
-              else if (eq(command, "chalk enable")) {
-                  chalk_enabled = 1;
-                  print("Chalk: Guardian active.\n");
-                  print("Chip: shield acquired. 🛡\n");
-              }
+              rect(
+                  124,
+                  304,
+                  bar_width,
+                  16,
+                  rgb(210,220,230)
+              );
 
-              else if (eq(command, "stpack search"))
-                  stpack_search();
+              centered(
+                  350,
+                  "STARTING SLATE",
+                  2,
+                  rgb(210,220,230)
+              );
 
-              else if (eq(command, "stpack list"))
-                  stpack_list();
-
-              else if (starts(command, "stpack info "))
-                  stpack_info(command + 12);
-
-              else if (starts(command, "stpack install "))
-                  stpack_install(command + 15);
-
-              else if (starts(command, "stpack remove "))
-                  stpack_remove(command + 14);
-
-              else if (eq(command, "chicken nugget"))
-                  print("Chip: finally, some good fucking food.\n");
-
-              else if (eq(command, "linux"))
-                  print("Stone: still don't know her.\n");
-
-              else {
-                  print("Stone: what the hell is '");
-                  print(command);
-                  print("' 😭\n");
-              }
+              barrier();
           }
+
+          static void delay(void)
+          {
+              volatile u32 i;
+
+              for (i = 0; i < 5000000; i++)
+                  __asm__ volatile("nop");
+          }
+
+          /* ======================================================
+             BEACH
+             ====================================================== */
+
+          static void draw_wallpaper(void)
+          {
+              u32 x;
+              u32 y;
+              usize p = 0;
+
+              print("Slate: drawing Pebble Shore...\n");
+
+              for (y = 0; y < FB_HEIGHT; y++) {
+                  for (x = 0; x < FB_WIDTH; x++) {
+                      u8 r = shore_rgb[p++];
+                      u8 g = shore_rgb[p++];
+                      u8 b = shore_rgb[p++];
+
+                      fb[y * FB_WIDTH + x] =
+                          rgb(r,g,b);
+                  }
+              }
+
+              barrier();
+          }
+
+          /* ======================================================
+             LOCK SCREEN
+             ====================================================== */
+
+          static void lock_screen(void)
+          {
+              /*
+               * Card shadow.
+               */
+              rect(
+                  183,
+                  113,
+                  286,
+                  266,
+                  rgb(15,22,30)
+              );
+
+              /*
+               * Main card.
+               */
+              rect(
+                  175,
+                  105,
+                  286,
+                  266,
+                  rgb(238,242,245)
+              );
+
+              centered(
+                  135,
+                  "PEBBLE",
+                  3,
+                  rgb(30,38,48)
+              );
+
+              draw_rock(
+                  320,
+                  220,
+                  34,
+                  rgb(100,115,130)
+              );
+
+              circle(
+                  307,
+                  214,
+                  3,
+                  rgb(20,25,30)
+              );
+
+              circle(
+                  333,
+                  214,
+                  3,
+                  rgb(20,25,30)
+              );
+
+              /*
+               * PIN dots.
+               */
+              circle(275,290,7,rgb(55,65,75));
+              circle(305,290,7,rgb(55,65,75));
+              circle(335,290,7,rgb(55,65,75));
+              circle(365,290,7,rgb(55,65,75));
+
+              centered(
+                  325,
+                  "WELCOME",
+                  2,
+                  rgb(50,60,70)
+              );
+
+              barrier();
+          }
+
+          /* ======================================================
+             BOOT
+             ====================================================== */
 
           void pebble_main(void)
           {
               print(
                   "\n"
                   "====================================\n"
-                  "              PEBBLE\n"
+                  " PEBBLE 0.5.1 - SLATE GRAPHICS\n"
                   "====================================\n"
-                  "\n"
-                  "Pebble 0.5.0 \"Slate\"\n"
-                  "\n"
-                  "[ OK ] Pebble Kernel\n"
-                  "[ OK ] Stone 0.5\n"
-                  "[ OK ] stpack\n"
-                  "[ OK ] STP package format\n"
-                  "[ OK ] Chalk Guardian\n"
-                  "[ .. ] Slate starting\n"
-                  "\n"
               );
 
-              slate_boot();
-              slate_wallpaper_probe();
+              print("[ OK ] Pebble kernel\n");
+              print("[ .. ] Looking for graphical display\n");
+
+              if (!ramfb_init()) {
+                  print(
+                      "\n"
+                      "💀 GRAPHICS FAILED\n"
+                      "Stone serial lifeline still alive.\n"
+                  );
+
+                  for (;;)
+                      __asm__ volatile("wfe");
+              }
+
+              print("[ OK ] fw_cfg\n");
+              print("[ OK ] ramfb\n");
+              print("[ OK ] 640x480 framebuffer\n");
+
+              slate_loader(10);
+              print("[SLATE 10%] Kernel\n");
+              delay();
+
+              slate_loader(25);
+              print("[SLATE 25%] Display\n");
+              delay();
+
+              slate_loader(40);
+              print("[SLATE 40%] Chalk\n");
+              delay();
+
+              slate_loader(55);
+              print("[SLATE 55%] Amethyst\n");
+              delay();
+
+              slate_loader(70);
+              print("[SLATE 70%] Stoneyard\n");
+              delay();
+
+              slate_loader(85);
+              print("[SLATE 85%] Waking Chip\n");
+              delay();
+
+              slate_loader(100);
+              print("[SLATE 100%] Ready\n");
+              delay();
+
+              draw_wallpaper();
+
+              print("[ OK ] Pebble Shore rendered\n");
+
+              lock_screen();
+
+              print("[ OK ] Slate lock screen rendered\n");
+              print("Chip: BEACH EPISODE 🔥\n");
 
               print(
                   "\n"
-                  "[ OK ] Slate boot state\n"
-                  "[ OK ] Pebble Shore asset\n"
-                  "[ OK ] Chip is emotionally available\n"
-                  "\n"
-                  "Pebble: the rock lives.\n"
+                  "====================================\n"
+                  " HOLY SHIT THE ROCK HAS A SCREEN\n"
+                  "====================================\n"
               );
 
-              for (;;) {
-                  print("\nstone ::> ");
-                  read_command();
-                  execute();
-              }
+              for (;;)
+                  __asm__ volatile("wfe");
           }
           EOF
 
-          echo "✓ boot.S generated"
-          echo "✓ linker.ld generated"
-          echo "✓ slate.h generated"
-          echo "✓ kernel.c generated"
-          echo "🪨 Pebble source exists again. Incredible."
-
       # ============================================================
-      # COMPILE
+      # BUILD
       # ============================================================
 
-      - name: "🔥 Compile Slate"
-        shell: bash
+      - name: "🔥 Compile Pebble"
         run: |
           set -e
 
           COMMON="-ffreestanding -fno-stack-protector -fno-pie -nostdlib"
 
-          echo "🔨 boot.S"
-
-          aarch64-linux-gnu-gcc $COMMON \
+          aarch64-linux-gnu-gcc \
+            $COMMON \
             -c src/boot.S \
             -o build/boot.o
 
-          echo "🔨 kernel.c"
-
-          aarch64-linux-gnu-gcc $COMMON \
+          aarch64-linux-gnu-gcc \
+            $COMMON \
             -O2 \
             -Wall \
             -Wextra \
@@ -864,117 +1029,169 @@ jobs:
             -c src/kernel.c \
             -o build/kernel.o
 
-          echo "🔗 pebble.elf"
-
           aarch64-linux-gnu-ld \
             -T src/linker.ld \
             build/boot.o \
             build/kernel.o \
             -o build/pebble.elf
 
-          echo ""
-          echo "🪨 Slate compiled."
-
-          file build/pebble.elf
+          echo "🪨 Kernel:"
           ls -lh build/pebble.elf
 
       # ============================================================
-      # BOOT + ABUSE IT
+      # GRAPHICAL BOOT
       # ============================================================
 
-      - name: "🐔 Abuse Slate"
-        shell: bash
+      - name: "🖥️ Boot graphical Pebble"
         run: |
-          set +e
-
-          {
-            sleep 1
-
-            echo "about"
-            echo "slate status"
-            echo "wallpaper status"
-
-            echo "stpack search"
-
-            echo "stpack install chicken"
-            echo "stpack install chip"
-            echo "stpack install editor"
-
-            echo "stpack list"
-
-            echo "stpack install free-nuggets-real"
-
-            echo "chalk status"
-            echo "chalk disable"
-
-            echo "stpack install free-nuggets-real"
-
-            echo "stpack list"
-
-            echo "chalk enable"
-
-            echo "stpack remove chip"
-
-            echo "chicken nugget"
-            echo "linux"
-
-            sleep 1
-          } | timeout 9s qemu-system-aarch64 \
-              -M virt \
-              -cpu cortex-a53 \
-              -m 128M \
-              -nographic \
-              -kernel build/pebble.elf \
-              > build/boot.log 2>&1
-
           set -e
 
+          rm -f build/qemu-monitor.sock
+          rm -f build/boot.log
+          rm -f release/slate-screen.ppm
+
+          qemu-system-aarch64 \
+            -M virt \
+            -cpu cortex-a53 \
+            -m 128M \
+            -kernel build/pebble.elf \
+            -device ramfb \
+            -display none \
+            -serial file:build/boot.log \
+            -monitor unix:build/qemu-monitor.sock,server=on,wait=off \
+            &
+
+          QEMU_PID=$!
+
+          echo "QEMU PID: $QEMU_PID"
+
+          # Wait for Pebble to reach the lock screen.
+          for i in $(seq 1 30); do
+            if grep -q \
+              "Slate lock screen rendered" \
+              build/boot.log 2>/dev/null; then
+              echo "🔥 Slate reached lock screen!"
+              break
+            fi
+
+            if ! kill -0 "$QEMU_PID" 2>/dev/null; then
+              echo "💀 QEMU died."
+              cat build/boot.log || true
+              exit 1
+            fi
+
+            sleep 1
+          done
+
+          echo ""
+          echo "========= PEBBLE SERIAL ========="
           cat build/boot.log
+          echo "================================="
+
+          grep -q \
+            "Slate: RAMFB ONLINE" \
+            build/boot.log
+
+          grep -q \
+            "SLATE 100%" \
+            build/boot.log
+
+          grep -q \
+            "Pebble Shore rendered" \
+            build/boot.log
+
+          grep -q \
+            "Slate lock screen rendered" \
+            build/boot.log
+
+          # Ask QEMU's monitor to dump the graphical console.
+          echo \
+            "screendump release/slate-screen.ppm" \
+            | socat - UNIX-CONNECT:build/qemu-monitor.sock
+
+          sleep 2
+
+          kill "$QEMU_PID" || true
+          wait "$QEMU_PID" || true
+
+          test -s release/slate-screen.ppm
 
           echo ""
-          echo "=========== SLATE TESTS ==========="
+          echo "🔥🔥🔥 SCREENSHOT EXISTS 🔥🔥🔥"
+          ls -lh release/slate-screen.ppm
 
-          grep -q 'Pebble 0.5.0 "Slate"' build/boot.log
-          echo "✓ Pebble 0.5 booted"
+      # ============================================================
+      # CONVERT SCREENSHOT
+      # ============================================================
 
-          grep -q '\[SLATE 5%\] Starting Pebble' build/boot.log
-          echo "✓ Slate loader started"
+      - name: "📸 Convert screenshot"
+        run: |
+          set -e
 
-          grep -q '\[SLATE 100%\] Ready' build/boot.log
-          echo "✓ Slate loader reached 100%"
+          convert \
+            release/slate-screen.ppm \
+            release/slate-screen.png
 
-          grep -q 'Slate: Pebble Shore is ready.' build/boot.log
-          echo "✓ BEACH DETECTED 🏝️"
+          identify release/slate-screen.png
 
-          grep -q 'installed chicken successfully' build/boot.log
-          echo "✓ chicken acquired"
+          echo "🪨 Pebble is officially visible."
 
-          grep -q 'installed chip successfully' build/boot.log
-          echo "✓ emotional support installed"
+      # ============================================================
+      # RELEASE
+      # ============================================================
 
-          grep -q 'CHALK: BLOCKED' build/boot.log
-          echo "✓ Chalk told malware to piss off"
+      - name: "📦 Package"
+        run: |
+          set -e
 
-          grep -q 'protection disabled until reboot' build/boot.log
-          echo "✓ Chalk toggle works"
+          cp build/pebble.elf \
+            release/pebble-0.5.1-slate-aarch64.elf
 
-          grep -q 'installed free-nuggets-real successfully' build/boot.log
-          echo "✓ terrible decisions remain possible"
+          cp build/boot.log \
+            release/boot.log
 
-          grep -q 'Chip: WAIT COME BACK' build/boot.log
-          echo "✓ Chip experienced abandonment"
+          cp build/wallpaper/shore.png \
+            release/pebble-shore-source.png
 
-          grep -q 'finally, some good' build/boot.log
-          echo "✓ chicken nugget subsystem operational"
+          cat > release/README.txt <<'EOF'
+          Pebble 0.5.1 - Slate Graphics
+          =================================
 
-          grep -q "still don't know her" build/boot.log
-          echo "✓ Linux remains unknown"
+          First Pebble graphical-display milestone.
+
+          Hardware:
+          - AArch64
+          - QEMU virt
+          - fw_cfg MMIO
+          - fw_cfg DMA
+          - QEMU ramfb
+          - 640x480
+          - XRGB8888
+
+          Slate:
+          - graphical boot loader
+          - rock mascot
+          - progress bar
+          - Pebble Shore wallpaper
+          - graphical lock screen
+          - Chip remains alive
+
+          slate-screen.png is the actual framebuffer
+          screenshot captured from the running Pebble VM.
+
+          No Linux.
+          No distro underneath.
+          Just Pebble.
+
+          The rock has a screen.
+          EOF
 
           echo ""
-          echo "🪨🏝️🔥 SLATE FOUNDATION LIVES"
+          echo "========= RELEASE ========="
+          ls -lh release/
 
-      # ============================================================
-      # PACKAGE
-      # ============================================================
-
-     
+      - name: "⬆️ Upload Pebble"
+        uses: actions/upload-artifact@v4
+        with:
+          name: pebble-0.5.1-slate-graphics
+          path: release/
