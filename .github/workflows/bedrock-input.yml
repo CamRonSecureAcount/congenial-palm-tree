@@ -1,0 +1,688 @@
+name: "🖱️ Pebble 1.0 — Bedrock Input"
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  input:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: "📦 Checkout"
+        uses: actions/checkout@v4
+
+      - name: "🖱️ Teach Pebble what a mouse is"
+        shell: python
+        run: |
+          from pathlib import Path
+
+          p = Path("src/kernel.c")
+          s = p.read_text()
+
+          if "BEDROCK VIRTIO INPUT" in s:
+              print("🪨 Input code already installed.")
+              raise SystemExit(0)
+
+          marker = "/* ======================================================\n             PEBBLE MAIN"
+
+          if marker not in s:
+              raise SystemExit("💀 Could not find Pebble main marker")
+
+          driver = r'''
+          /* ======================================================
+             BEDROCK VIRTIO INPUT
+             ======================================================
+
+             Pebble 1.0's first real input driver.
+
+             QEMU virt exposes virtio-mmio transports beginning at
+             0x0A000000.
+
+             We scan the transports looking for device ID 18:
+             virtio-input.
+
+             No interrupts yet. Bedrock Alpha polls the used ring.
+             Simple. Ugly. Extremely Pebble.
+             ====================================================== */
+
+          #define VIRTIO_MMIO_BASE       0x0A000000UL
+          #define VIRTIO_MMIO_STEP       0x200UL
+          #define VIRTIO_MMIO_SLOTS      32U
+
+          #define VIRTIO_MAGIC           0x74726976U
+          #define VIRTIO_INPUT_DEVICE    18U
+
+          #define VMMIO_MAGIC_VALUE      0x000
+          #define VMMIO_VERSION          0x004
+          #define VMMIO_DEVICE_ID        0x008
+          #define VMMIO_VENDOR_ID        0x00c
+
+          #define VMMIO_DEVICE_FEATURES  0x010
+          #define VMMIO_DEVICE_FEAT_SEL  0x014
+
+          #define VMMIO_DRIVER_FEATURES  0x020
+          #define VMMIO_DRIVER_FEAT_SEL  0x024
+
+          #define VMMIO_QUEUE_SEL        0x030
+          #define VMMIO_QUEUE_NUM_MAX    0x034
+          #define VMMIO_QUEUE_NUM        0x038
+          #define VMMIO_QUEUE_READY      0x044
+          #define VMMIO_QUEUE_NOTIFY     0x050
+
+          #define VMMIO_INTERRUPT_STATUS 0x060
+          #define VMMIO_INTERRUPT_ACK    0x064
+          #define VMMIO_STATUS           0x070
+
+          #define VMMIO_QUEUE_DESC_LOW   0x080
+          #define VMMIO_QUEUE_DESC_HIGH  0x084
+          #define VMMIO_QUEUE_AVAIL_LOW  0x090
+          #define VMMIO_QUEUE_AVAIL_HIGH 0x094
+          #define VMMIO_QUEUE_USED_LOW   0x0a0
+          #define VMMIO_QUEUE_USED_HIGH  0x0a4
+
+          #define VIRTIO_STATUS_ACKNOWLEDGE 1U
+          #define VIRTIO_STATUS_DRIVER      2U
+          #define VIRTIO_STATUS_DRIVER_OK   4U
+          #define VIRTIO_STATUS_FEATURES_OK 8U
+
+          #define VRING_DESC_F_WRITE 2U
+
+          #define EV_SYN 0U
+          #define EV_KEY 1U
+          #define EV_REL 2U
+          #define EV_ABS 3U
+
+          #define REL_X 0U
+          #define REL_Y 1U
+
+          #define BTN_LEFT 0x110U
+
+          #define INPUT_QUEUE_SIZE 8U
+
+          struct virtq_desc {
+              u64 addr;
+              u32 len;
+              u16 flags;
+              u16 next;
+          } __attribute__((packed));
+
+          struct virtq_avail {
+              u16 flags;
+              u16 idx;
+              u16 ring[INPUT_QUEUE_SIZE];
+              u16 used_event;
+          } __attribute__((packed));
+
+          struct virtq_used_elem {
+              u32 id;
+              u32 len;
+          } __attribute__((packed));
+
+          struct virtq_used {
+              u16 flags;
+              u16 idx;
+              struct virtq_used_elem ring[INPUT_QUEUE_SIZE];
+              u16 avail_event;
+          } __attribute__((packed));
+
+          struct virtio_input_event {
+              u16 type;
+              u16 code;
+              u32 value;
+          } __attribute__((packed));
+
+          static struct virtq_desc input_desc[INPUT_QUEUE_SIZE]
+              __attribute__((aligned(16)));
+
+          static struct virtq_avail input_avail
+              __attribute__((aligned(2)));
+
+          static struct virtq_used input_used
+              __attribute__((aligned(4)));
+
+          static struct virtio_input_event
+              input_events[INPUT_QUEUE_SIZE]
+              __attribute__((aligned(8)));
+
+          static volatile u8 *input_mmio = 0;
+
+          static u16 input_last_used = 0;
+
+          static int cursor_x = 520;
+          static int cursor_y = 100;
+
+          static int mouse_left = 0;
+
+          static u32 mmio_read(u32 offset)
+          {
+              return *(volatile u32 *)(input_mmio + offset);
+          }
+
+          static void mmio_write(u32 offset, u32 value)
+          {
+              *(volatile u32 *)(input_mmio + offset) = value;
+              barrier();
+          }
+
+          static void split_address(
+              u64 address,
+              u32 *low,
+              u32 *high)
+          {
+              *low  = (u32)(address & 0xffffffffUL);
+              *high = (u32)(address >> 32);
+          }
+
+          static int virtio_find_input(void)
+          {
+              u32 slot;
+
+              print("\n[ .. ] Scanning VirtIO MMIO\n");
+
+              for (slot = 0;
+                   slot < VIRTIO_MMIO_SLOTS;
+                   slot++) {
+
+                  volatile u8 *base =
+                      (volatile u8 *)(
+                          VIRTIO_MMIO_BASE +
+                          ((u64)slot * VIRTIO_MMIO_STEP)
+                      );
+
+                  u32 magic =
+                      *(volatile u32 *)(base + VMMIO_MAGIC_VALUE);
+
+                  u32 device;
+
+                  if (magic != VIRTIO_MAGIC)
+                      continue;
+
+                  device =
+                      *(volatile u32 *)(base + VMMIO_DEVICE_ID);
+
+                  if (device == VIRTIO_INPUT_DEVICE) {
+                      input_mmio = base;
+
+                      print("[ OK ] VirtIO input found at slot ");
+                      print_u32(slot);
+                      print("\n");
+
+                      return 1;
+                  }
+              }
+
+              print("[FAIL] No VirtIO input device\n");
+              return 0;
+          }
+
+          static int virtio_input_init(void)
+          {
+              u32 max;
+              u32 lo;
+              u32 hi;
+              u32 i;
+              u32 status;
+
+              if (!virtio_find_input())
+                  return 0;
+
+              print("[ .. ] Initializing pointer\n");
+
+              /*
+               * Reset.
+               */
+              mmio_write(VMMIO_STATUS, 0);
+
+              /*
+               * ACKNOWLEDGE + DRIVER.
+               */
+              status =
+                  VIRTIO_STATUS_ACKNOWLEDGE |
+                  VIRTIO_STATUS_DRIVER;
+
+              mmio_write(
+                  VMMIO_STATUS,
+                  status
+              );
+
+              /*
+               * Bedrock Alpha negotiates no optional features.
+               */
+              mmio_write(
+                  VMMIO_DRIVER_FEAT_SEL,
+                  0
+              );
+
+              mmio_write(
+                  VMMIO_DRIVER_FEATURES,
+                  0
+              );
+
+              mmio_write(
+                  VMMIO_DRIVER_FEAT_SEL,
+                  1
+              );
+
+              mmio_write(
+                  VMMIO_DRIVER_FEATURES,
+                  0
+              );
+
+              status |=
+                  VIRTIO_STATUS_FEATURES_OK;
+
+              mmio_write(
+                  VMMIO_STATUS,
+                  status
+              );
+
+              if (!(
+                  mmio_read(VMMIO_STATUS) &
+                  VIRTIO_STATUS_FEATURES_OK)) {
+
+                  print("[FAIL] VirtIO rejected features\n");
+                  return 0;
+              }
+
+              /*
+               * Event queue = queue 0.
+               */
+              mmio_write(
+                  VMMIO_QUEUE_SEL,
+                  0
+              );
+
+              max =
+                  mmio_read(VMMIO_QUEUE_NUM_MAX);
+
+              print("VirtIO: queue max = ");
+              print_u32(max);
+              print("\n");
+
+              if (max < INPUT_QUEUE_SIZE) {
+                  print("[FAIL] Input queue too small\n");
+                  return 0;
+              }
+
+              mmio_write(
+                  VMMIO_QUEUE_NUM,
+                  INPUT_QUEUE_SIZE
+              );
+
+              /*
+               * Clear rings.
+               */
+              for (i = 0;
+                   i < INPUT_QUEUE_SIZE;
+                   i++) {
+
+                  input_desc[i].addr =
+                      (u64)&input_events[i];
+
+                  input_desc[i].len =
+                      sizeof(struct virtio_input_event);
+
+                  input_desc[i].flags =
+                      VRING_DESC_F_WRITE;
+
+                  input_desc[i].next = 0;
+
+                  input_avail.ring[i] =
+                      (u16)i;
+
+                  input_events[i].type = 0;
+                  input_events[i].code = 0;
+                  input_events[i].value = 0;
+              }
+
+              input_avail.flags = 0;
+              input_avail.idx =
+                  INPUT_QUEUE_SIZE;
+
+              input_used.flags = 0;
+              input_used.idx = 0;
+
+              input_last_used = 0;
+
+              /*
+               * Tell QEMU where our queue lives.
+               */
+              split_address(
+                  (u64)&input_desc,
+                  &lo,
+                  &hi
+              );
+
+              mmio_write(
+                  VMMIO_QUEUE_DESC_LOW,
+                  lo
+              );
+
+              mmio_write(
+                  VMMIO_QUEUE_DESC_HIGH,
+                  hi
+              );
+
+              split_address(
+                  (u64)&input_avail,
+                  &lo,
+                  &hi
+              );
+
+              mmio_write(
+                  VMMIO_QUEUE_AVAIL_LOW,
+                  lo
+              );
+
+              mmio_write(
+                  VMMIO_QUEUE_AVAIL_HIGH,
+                  hi
+              );
+
+              split_address(
+                  (u64)&input_used,
+                  &lo,
+                  &hi
+              );
+
+              mmio_write(
+                  VMMIO_QUEUE_USED_LOW,
+                  lo
+              );
+
+              mmio_write(
+                  VMMIO_QUEUE_USED_HIGH,
+                  hi
+              );
+
+              barrier();
+
+              mmio_write(
+                  VMMIO_QUEUE_READY,
+                  1
+              );
+
+              status |=
+                  VIRTIO_STATUS_DRIVER_OK;
+
+              mmio_write(
+                  VMMIO_STATUS,
+                  status
+              );
+
+              /*
+               * Kick the queue.
+               */
+              mmio_write(
+                  VMMIO_QUEUE_NOTIFY,
+                  0
+              );
+
+              print("[ OK ] Pointer queue online\n");
+
+              return 1;
+          }
+
+          static void cursor_draw(void)
+          {
+              int i;
+
+              /*
+               * Simple Pebble arrow.
+               */
+              for (i = 0; i < 15; i++) {
+                  pixel(
+                      cursor_x,
+                      cursor_y + i,
+                      rgb(255,255,255)
+                  );
+
+                  if (i < 10)
+                      pixel(
+                          cursor_x + i,
+                          cursor_y + i,
+                          rgb(255,255,255)
+                      );
+              }
+
+              rect(
+                  cursor_x + 4,
+                  cursor_y + 10,
+                  4,
+                  8,
+                  rgb(255,255,255)
+              );
+          }
+
+          static void cursor_restore(void)
+          {
+              /*
+               * Alpha 2 deliberately redraws the whole lock screen.
+               *
+               * It is inefficient.
+               * It is also hilarious and extremely easy to debug.
+               */
+              draw_shore();
+              lock_screen();
+          }
+
+          static void handle_input_event(
+              struct virtio_input_event *e)
+          {
+              int value =
+                  (int)e->value;
+
+              if (e->type == EV_REL) {
+
+                  if (e->code == REL_X)
+                      cursor_x += value;
+
+                  if (e->code == REL_Y)
+                      cursor_y += value;
+
+                  if (cursor_x < 0)
+                      cursor_x = 0;
+
+                  if (cursor_y < 0)
+                      cursor_y = 0;
+
+                  if (cursor_x > (int)FB_WIDTH - 16)
+                      cursor_x = (int)FB_WIDTH - 16;
+
+                  if (cursor_y > (int)FB_HEIGHT - 20)
+                      cursor_y = (int)FB_HEIGHT - 20;
+              }
+
+              if (
+                  e->type == EV_KEY &&
+                  e->code == BTN_LEFT
+              ) {
+                  mouse_left =
+                      value ? 1 : 0;
+
+                  if (mouse_left)
+                      print("Chip: HE CLICKED SOMETHING\n");
+              }
+          }
+
+          static int virtio_input_poll(void)
+          {
+              int changed = 0;
+
+              while (
+                  input_last_used !=
+                  input_used.idx
+              ) {
+                  u16 used_slot =
+                      input_last_used %
+                      INPUT_QUEUE_SIZE;
+
+                  u32 id =
+                      input_used.ring[
+                          used_slot
+                      ].id;
+
+                  if (id < INPUT_QUEUE_SIZE) {
+
+                      handle_input_event(
+                          &input_events[id]
+                      );
+
+                      /*
+                       * Give the buffer back to QEMU.
+                       */
+                      input_avail.ring[
+                          input_avail.idx %
+                          INPUT_QUEUE_SIZE
+                      ] = (u16)id;
+
+                      barrier();
+
+                      input_avail.idx++;
+
+                      barrier();
+
+                      mmio_write(
+                          VMMIO_QUEUE_NOTIFY,
+                          0
+                      );
+
+                      changed = 1;
+                  }
+
+                  input_last_used++;
+              }
+
+              /*
+               * We poll, so acknowledge anything QEMU raised.
+               */
+              {
+                  u32 irq =
+                      mmio_read(
+                          VMMIO_INTERRUPT_STATUS
+                      );
+
+                  if (irq)
+                      mmio_write(
+                          VMMIO_INTERRUPT_ACK,
+                          irq
+                      );
+              }
+
+              return changed;
+          }
+
+          static void bedrock_input_loop(void)
+          {
+              print("\n");
+              print("==============================\n");
+              print(" PEBBLE 1.0 - BEDROCK ALPHA\n");
+              print("==============================\n");
+
+              if (!virtio_input_init()) {
+                  print("Chip: where mouse\n");
+
+                  for (;;)
+                      __asm__ volatile("wfe");
+              }
+
+              print("[ OK ] Real pointer input\n");
+              print("Chip: what the fuck is that arrow\n");
+
+              cursor_draw();
+
+              for (;;) {
+
+                  if (virtio_input_poll()) {
+
+                      cursor_restore();
+                      cursor_draw();
+
+                      barrier();
+                  }
+              }
+          }
+
+          '''
+
+          s = s.replace(
+              marker,
+              driver + "\n          " + marker
+          )
+
+          old = '''              for (;;)
+                  __asm__ volatile("wfe");
+          }'''
+
+          new = '''              /*
+               * Pebble 1.0 takes over here.
+               */
+              bedrock_input_loop();
+          }'''
+
+          # Replace ONLY the final idle loop.
+          pos = s.rfind(old)
+
+          if pos == -1:
+              raise SystemExit(
+                  "💀 Couldn't locate final Pebble idle loop"
+              )
+
+          s = (
+              s[:pos] +
+              new +
+              s[pos + len(old):]
+          )
+
+          p.write_text(s)
+
+          print("🔥 VirtIO input driver installed")
+          print("🪨 Chip is about to discover the cursor")
+
+      - name: "🔎 Verify patch"
+        run: |
+          set -eux
+
+          grep -q \
+            "BEDROCK VIRTIO INPUT" \
+            src/kernel.c
+
+          grep -q \
+            "virtio_input_init" \
+            src/kernel.c
+
+          grep -q \
+            "bedrock_input_loop" \
+            src/kernel.c
+
+          echo "🔥 Bedrock input source ready"
+
+      - name: "🚀 Commit Bedrock Alpha 2"
+        run: |
+          set -eux
+
+          git config \
+            user.name \
+            "Pebble Builder"
+
+          git config \
+            user.email \
+            "pebble@users.noreply.github.com"
+
+          git add src/kernel.c
+
+          if git diff --cached --quiet; then
+            echo "🪨 Nothing new to commit."
+            exit 0
+          fi
+
+          git commit \
+            -m "🖱️ Add Pebble Bedrock VirtIO input"
+
+          git push
+
+          echo ""
+          echo "🔥 INPUT DRIVER COMMITTED"
